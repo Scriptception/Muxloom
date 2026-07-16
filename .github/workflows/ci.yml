@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "agent/**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.96.0
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets
+      - run: cargo build --release --locked
+
+  distro-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ubuntu:22.04
+            setup: apt-get update && apt-get install -y curl build-essential pkg-config ca-certificates
+          - image: debian:12
+            setup: apt-get update && apt-get install -y curl build-essential pkg-config ca-certificates
+          - image: rockylinux:9
+            setup: dnf install -y curl gcc gcc-c++ make pkgconf-pkg-config ca-certificates
+    container: ${{ matrix.image }}
+    steps:
+      - run: ${{ matrix.setup }}
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install and smoke test
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.96.0
+          . "$HOME/.cargo/env"
+          cargo build --locked
+          target/debug/muxloom --version
+
+  dependency-policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
