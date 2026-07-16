@@ -721,7 +721,7 @@ async fn server_command(paths: &AppPaths, command: ServerCommand) -> Result<()> 
             Ok(())
         }
         ServerCommand::Stop => {
-            let _ = client::request(paths, Request::Shutdown).await;
+            let _ = client::stop_daemon(paths).await;
             Ok(())
         }
     }

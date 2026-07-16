@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::{
@@ -70,6 +70,7 @@ pub struct App {
     pub prompt_mode: bool,
     pub prompt: String,
     pub toast: String,
+    creating_workspace: bool,
     confirm_close: bool,
     parsers: HashMap<String, vt100::Parser>,
     pending_chord: Option<char>,
@@ -105,6 +106,7 @@ impl App {
             prompt_mode: false,
             prompt: String::new(),
             toast: "Navigation mode · press Enter to focus the agent".into(),
+            creating_workspace: false,
             confirm_close: false,
             parsers,
             pending_chord: None,
@@ -154,10 +156,15 @@ impl App {
             }
             Response::Schedules { schedules } => self.schedules = schedules,
             Response::Error { message } => self.toast = format!("Error · {message}"),
-            Response::Ok
-            | Response::Pong { .. }
-            | Response::WorkspaceCreated { .. }
-            | Response::Capture { .. } => {}
+            Response::WorkspaceCreated { workspace } => {
+                self.workspace_id = workspace.id.clone();
+                self.workspaces.push(workspace);
+                self.selected_pane = 0;
+                self.view = View::Workspace;
+                self.ensure_parsers();
+                self.toast = "New workspace ready".into();
+            }
+            Response::Ok | Response::Pong { .. } | Response::Capture { .. } => {}
         }
     }
 
@@ -165,6 +172,7 @@ impl App {
         if is_navigation_toggle(key) {
             self.navigation = !self.navigation;
             self.prompt_mode = false;
+            self.creating_workspace = false;
             self.toast = if self.navigation {
                 "Navigation mode".into()
             } else {
@@ -220,6 +228,12 @@ impl App {
             (KeyCode::Char('?'), _) => self.set_view(View::Help),
             (KeyCode::Char('j') | KeyCode::Down, _) => self.select_next(),
             (KeyCode::Char('k') | KeyCode::Up, _) => self.select_previous(),
+            (KeyCode::Char('h') | KeyCode::BackTab, _) => {
+                return self.switch_workspace(false);
+            }
+            (KeyCode::Char('l') | KeyCode::Tab, _) => {
+                return self.switch_workspace(true);
+            }
             (KeyCode::Char('g'), _) => self.selected_pane = 0,
             (KeyCode::Char('G'), _) => {
                 self.selected_pane = self
@@ -232,7 +246,14 @@ impl App {
             }
             (KeyCode::Char('p'), _) if self.view == View::Workspace => {
                 self.prompt_mode = true;
+                self.creating_workspace = false;
                 self.prompt.clear();
+            }
+            (KeyCode::Char('c'), _) if self.view == View::Workspace => {
+                self.prompt_mode = true;
+                self.creating_workspace = true;
+                self.prompt.clear();
+                self.toast = "Name the new workspace".into();
             }
             (KeyCode::Char('v'), _) if self.view == View::Workspace => {
                 self.split_axis = SplitAxis::Columns;
@@ -259,11 +280,31 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.prompt_mode = false;
+                self.creating_workspace = false;
                 self.prompt.clear();
                 Action::None
             }
             KeyCode::Enter => {
                 self.prompt_mode = false;
+                if self.creating_workspace {
+                    self.creating_workspace = false;
+                    let name = if self.prompt.trim().is_empty() {
+                        "workspace".to_string()
+                    } else {
+                        self.prompt.trim().to_string()
+                    };
+                    self.prompt.clear();
+                    let cwd = self
+                        .selected_pane()
+                        .map(|pane| pane.cwd.clone())
+                        .unwrap_or_else(|| ".".into());
+                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+                    return Action::Send(Request::CreateWorkspace {
+                        name,
+                        cwd,
+                        command: vec![shell, "-l".into()],
+                    });
+                }
                 let mut data = self.prompt.as_bytes().to_vec();
                 data.push(b'\n');
                 self.prompt.clear();
@@ -299,6 +340,32 @@ impl App {
             cwd,
             command: vec![shell, "-l".into()],
             title: Some("shell".into()),
+        })
+    }
+
+    fn switch_workspace(&mut self, forward: bool) -> Action {
+        if self.workspaces.len() < 2 {
+            self.toast = "Only one workspace · press c to create another".into();
+            return Action::None;
+        }
+        let current = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == self.workspace_id)
+            .unwrap_or(0);
+        let index = if forward {
+            (current + 1) % self.workspaces.len()
+        } else if current == 0 {
+            self.workspaces.len() - 1
+        } else {
+            current - 1
+        };
+        self.workspace_id = self.workspaces[index].id.clone();
+        self.selected_pane = 0;
+        self.view = View::Workspace;
+        self.toast = format!("Workspace · {}", self.workspaces[index].name);
+        Action::Send(Request::SwitchWorkspace {
+            workspace_id: self.workspace_id.clone(),
         })
     }
 
@@ -502,7 +569,65 @@ impl App {
     }
 
     fn render_rail(&self, frame: &mut Frame, area: Rect) {
-        let items = self.current_workspace().map_or_else(Vec::new, |workspace| {
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .split(area);
+        let workspace_items = self
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                let selected = workspace.id == self.workspace_id;
+                let attention = workspace.panes.iter().filter(|pane| pane.unread).count();
+                let running = workspace
+                    .panes
+                    .iter()
+                    .filter(|pane| pane.exited_at.is_none() && pane.state != AgentState::Exited)
+                    .count();
+                let style = if selected {
+                    Style::default()
+                        .fg(INK)
+                        .bg(VIOLET)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(TEXT)
+                };
+                let marker = if selected { "›" } else { " " };
+                let badge = if attention > 0 {
+                    format!(" ◆{attention}")
+                } else if running > 0 {
+                    format!(" ●{running}")
+                } else {
+                    " ·".into()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {marker} "), style),
+                    Span::styled(workspace.name.clone(), style),
+                    Span::styled(badge, style),
+                ]))
+                .style(style)
+            })
+            .collect::<Vec<_>>();
+        let selected_workspace = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == self.workspace_id);
+        let mut workspace_state = ListState::default().with_selected(selected_workspace);
+        frame.render_stateful_widget(
+            List::new(workspace_items)
+                .block(
+                    Block::default()
+                        .title(" WORKSPACES · c new ")
+                        .title_style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD))
+                        .borders(Borders::RIGHT)
+                        .border_style(Style::default().fg(BORDER)),
+                )
+                .style(Style::default().bg(SURFACE)),
+            sections[0],
+            &mut workspace_state,
+        );
+
+        let pane_items = self.current_workspace().map_or_else(Vec::new, |workspace| {
             workspace
                 .panes
                 .iter()
@@ -527,16 +652,16 @@ impl App {
                 .collect()
         });
         frame.render_widget(
-            List::new(items)
+            List::new(pane_items)
                 .block(
                     Block::default()
-                        .title(" WORKSPACE ")
+                        .title(" PANES · v/s split ")
                         .title_style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD))
-                        .borders(Borders::RIGHT)
+                        .borders(Borders::TOP | Borders::RIGHT)
                         .border_style(Style::default().fg(BORDER)),
                 )
                 .style(Style::default().bg(SURFACE)),
-            area,
+            sections[1],
         );
     }
 
@@ -897,8 +1022,10 @@ impl App {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Line::raw("j/k         select pane"),
+            Line::raw("h/l · Tab   switch workspace"),
             Line::raw("Enter / i   focus selected agent"),
             Line::raw("Ctrl-\\ / F12 toggle focus / navigation"),
+            Line::raw("c           create named workspace"),
             Line::raw("v / s       split with a new shell"),
             Line::raw("p           quick prompt composer"),
             Line::raw("[a / ]a     previous / next attention"),
@@ -924,12 +1051,17 @@ impl App {
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         if self.prompt_mode {
+            let title = if self.creating_workspace {
+                " NEW WORKSPACE · Enter to create · Esc to cancel "
+            } else {
+                " QUICK PROMPT · Enter to send · Esc to cancel "
+            };
             frame.render_widget(Clear, area);
             frame.render_widget(
                 Paragraph::new(self.prompt.as_str())
                     .block(
                         Block::default()
-                            .title(" QUICK PROMPT · Enter to send · Esc to cancel ")
+                            .title(title)
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(ACCENT)),
                     )
@@ -939,8 +1071,10 @@ impl App {
             return;
         }
         let mode = if self.navigation { " NAV " } else { " AGENT " };
-        let hints = if self.navigation {
-            " j/k select   Enter focus   p prompt   A attention   1–7 views   ? help   q detach "
+        let hints = if self.navigation && area.width < 100 {
+            " h/l ws   j/k pane   c new   v/s split   Enter focus   q detach "
+        } else if self.navigation {
+            " h/l workspace   j/k pane   c new   v/s split   Enter focus   p prompt   q detach "
         } else {
             " Input is passing directly to the agent · Ctrl-\\ or F12 returns to navigation "
         };
@@ -1134,6 +1268,56 @@ mod tests {
         assert!(matches!(
             app.process_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
             Action::Send(Request::ClosePane { pane_id }) if pane_id == "pane-id"
+        ));
+    }
+
+    #[test]
+    fn workspaces_can_be_created_and_switched_from_navigation() {
+        let first = WorkspaceSummary {
+            id: "first-id".into(),
+            name: "First".into(),
+            created_at: Utc::now(),
+            panes: Vec::new(),
+        };
+        let second = WorkspaceSummary {
+            id: "second-id".into(),
+            name: "Second".into(),
+            created_at: Utc::now(),
+            panes: Vec::new(),
+        };
+        let mut app = App::new(
+            first.id.clone(),
+            vec![first, second],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HermesSnapshot::default(),
+        );
+
+        assert!(matches!(
+            app.process_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+            Action::Send(Request::SwitchWorkspace { workspace_id }) if workspace_id == "second-id"
+        ));
+        assert!(matches!(
+            app.process_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
+            Action::Send(Request::SwitchWorkspace { workspace_id }) if workspace_id == "first-id"
+        ));
+
+        assert!(matches!(
+            app.process_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Action::None
+        ));
+        for character in "Review".chars() {
+            assert!(matches!(
+                app.process_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+                Action::None
+            ));
+        }
+        assert!(matches!(
+            app.process_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::Send(Request::CreateWorkspace { name, command, .. })
+                if name == "Review" && !command.is_empty()
         ));
     }
 

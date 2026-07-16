@@ -8,7 +8,7 @@ use crate::model::{
     AgentState, AttentionEvent, EventConfidence, ScheduleRecord, UsageSnapshot, WorkspaceSummary,
 };
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +32,9 @@ pub enum Request {
     Attach {
         workspace_id: String,
         readonly: bool,
+    },
+    SwitchWorkspace {
+        workspace_id: String,
     },
     Input {
         pane_id: String,

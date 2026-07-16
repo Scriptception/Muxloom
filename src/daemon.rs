@@ -133,7 +133,7 @@ async fn handle_client(
     let first: Request = read_frame(&mut reader).await?;
 
     if let Request::Attach {
-        workspace_id,
+        mut workspace_id,
         readonly,
     } = first
     {
@@ -174,6 +174,29 @@ async fn handle_client(
             tokio::select! {
                 incoming = read_frame::<_, Request>(&mut reader) => {
                     let request = incoming?;
+                    if let Request::SwitchWorkspace { workspace_id: requested } = request {
+                        let buffered_output = {
+                            let guard = state.lock().await;
+                            guard.workspaces.contains_key(&requested).then(|| guard.panes.values()
+                                .filter(|pane| pane.summary.workspace_id == requested)
+                                .map(|pane| (pane.summary.id.clone(), pane.output.iter().copied().collect()))
+                                .collect::<Vec<(String, Vec<u8>)>>())
+                        };
+                        let Some(buffered_output) = buffered_output else {
+                            write_frame(&mut writer, &Response::Error {
+                                message: format!("workspace {requested} does not exist"),
+                            }).await?;
+                            continue;
+                        };
+                        workspace_id = requested;
+                        write_frame(&mut writer, &Response::Ok).await?;
+                        for (pane_id, data) in buffered_output {
+                            if !data.is_empty() {
+                                write_frame(&mut writer, &Response::Output { pane_id, data }).await?;
+                            }
+                        }
+                        continue;
+                    }
                     if readonly && matches!(request, Request::Input { .. } | Request::CreatePane { .. } | Request::ClosePane { .. }) {
                         write_frame(&mut writer, &Response::Error { message: "client is attached read-only".into() }).await?;
                         continue;
@@ -418,6 +441,9 @@ async fn dispatch(
             std::process::exit(0);
         }
         Request::Attach { .. } => bail!("attach must be the first request on a connection"),
+        Request::SwitchWorkspace { .. } => {
+            bail!("workspace switching requires an attached connection")
+        }
     };
     Ok(Some(response))
 }

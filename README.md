@@ -50,7 +50,9 @@ muxloom doctor
 
 | Key | Action |
 | --- | --- |
+| `h` / `l` or `Shift-Tab` / `Tab` | Switch workspace |
 | `j` / `k` | Select pane |
+| `c` | Create and switch to a named shell workspace |
 | `Enter` / `i` | Focus the selected terminal |
 | `v` / `s` | Add a column/row shell split |
 | `p` | Open the quick prompt composer |

@@ -31,19 +31,16 @@ pub async fn request(paths: &AppPaths, request: Request) -> Result<Response> {
 }
 
 pub async fn ensure_daemon(paths: &AppPaths) -> Result<()> {
-    if let Ok(mut stream) = UnixStream::connect(paths.socket()).await {
-        write_frame(
-            &mut stream,
-            &Request::Ping {
-                protocol_version: PROTOCOL_VERSION,
-            },
-        )
-        .await?;
-        if matches!(
-            read_frame::<_, Response>(&mut stream).await?,
-            Response::Pong { .. }
-        ) {
-            return Ok(());
+    if paths.socket().exists() {
+        match probe_daemon(paths).await {
+            Ok(Response::Pong { .. }) => return Ok(()),
+            Ok(Response::Error { message }) => {
+                bail!(
+                    "running Muxloom daemon is incompatible: {message}. Finish active work, then run `muxloom server stop` and retry"
+                );
+            }
+            Ok(other) => bail!("unexpected daemon health response: {other:?}"),
+            Err(_) => {}
         }
     }
     paths.ensure()?;
@@ -71,7 +68,7 @@ pub async fn ensure_daemon(paths: &AppPaths) -> Result<()> {
         .context("start Muxloom daemon")?;
     for _ in 0..50 {
         sleep(Duration::from_millis(40)).await;
-        if UnixStream::connect(paths.socket()).await.is_ok() {
+        if matches!(probe_daemon(paths).await, Ok(Response::Pong { .. })) {
             return Ok(());
         }
     }
@@ -79,6 +76,27 @@ pub async fn ensure_daemon(paths: &AppPaths) -> Result<()> {
         "Muxloom daemon did not become ready; inspect {}",
         paths.log().display()
     )
+}
+
+async fn probe_daemon(paths: &AppPaths) -> Result<Response> {
+    let mut stream = UnixStream::connect(paths.socket())
+        .await
+        .context("connect to daemon")?;
+    write_frame(
+        &mut stream,
+        &Request::Ping {
+            protocol_version: PROTOCOL_VERSION,
+        },
+    )
+    .await?;
+    read_frame(&mut stream).await
+}
+
+pub async fn stop_daemon(paths: &AppPaths) -> Result<()> {
+    let mut stream = UnixStream::connect(paths.socket())
+        .await
+        .context("connect to daemon")?;
+    write_frame(&mut stream, &Request::Shutdown).await
 }
 
 pub async fn attach(paths: &AppPaths, workspace_id: String, readonly: bool) -> Result<()> {
@@ -128,7 +146,15 @@ pub async fn attach(paths: &AppPaths, workspace_id: String, readonly: bool) -> R
         terminal.draw(|frame| app.render(frame))?;
         tokio::select! {
             server = read_frame::<_, Response>(&mut reader) => {
-                app.apply(server?);
+                let response = server?;
+                let created_workspace = match &response {
+                    Response::WorkspaceCreated { workspace } => Some(workspace.id.clone()),
+                    _ => None,
+                };
+                app.apply(response);
+                if let Some(workspace_id) = created_workspace {
+                    write_frame(&mut writer, &Request::SwitchWorkspace { workspace_id }).await?;
+                }
             }
             terminal_event = events.next() => {
                 let Some(Ok(event)) = terminal_event else { continue; };
