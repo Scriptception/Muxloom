@@ -17,6 +17,14 @@
 - Use `cargo fmt`, Clippy with warnings denied, tests, and a release build before handoff.
 - For TUI changes, verify 80x24, 120x40, and 200x60 layouts plus a real keyboard interaction.
 
+## Installation and runtime verification
+
+- Treat daemon restarts as destructive to live PTYs; enumerate affected panes and obtain confirmation first.
+- Keep source, release build, installed binary, and running daemon distinct. Verify each before saying an update is installed.
+- After installation, compare release and installed hashes, check `muxloom --version`, query `muxloom server status`, and run `muxloom list --json`.
+- For protocol changes, test a stale daemon explicitly and require an actionable mismatch response rather than an unexplained EOF.
+- Test terminal control keys as raw bytes as well as synthetic key events; Unix terminals may report `Ctrl-\\` as Control+`4`.
+
 ## Git
 
 - Commit as `Scriptception <joshuarussell.online@gmail.com>`.
