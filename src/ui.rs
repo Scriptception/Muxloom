@@ -162,13 +162,13 @@ impl App {
     }
 
     pub fn process_key(&mut self, key: KeyEvent) -> Action {
-        if key.code == KeyCode::Char('\\') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if is_navigation_toggle(key) {
             self.navigation = !self.navigation;
             self.prompt_mode = false;
             self.toast = if self.navigation {
                 "Navigation mode".into()
             } else {
-                "Agent focus · Ctrl-\\ to return".into()
+                "Agent focus · Ctrl-\\ or F12 to return".into()
             };
             return Action::None;
         }
@@ -228,7 +228,7 @@ impl App {
             }
             (KeyCode::Enter | KeyCode::Char('i'), _) if self.view == View::Workspace => {
                 self.navigation = false;
-                self.toast = "Agent focus · Ctrl-\\ to return".into();
+                self.toast = "Agent focus · Ctrl-\\ or F12 to return".into();
             }
             (KeyCode::Char('p'), _) if self.view == View::Workspace => {
                 self.prompt_mode = true;
@@ -898,7 +898,7 @@ impl App {
             ),
             Line::raw("j/k         select pane"),
             Line::raw("Enter / i   focus selected agent"),
-            Line::raw("Ctrl-\\      return to navigation"),
+            Line::raw("Ctrl-\\ / F12 toggle focus / navigation"),
             Line::raw("v / s       split with a new shell"),
             Line::raw("p           quick prompt composer"),
             Line::raw("[a / ]a     previous / next attention"),
@@ -942,7 +942,7 @@ impl App {
         let hints = if self.navigation {
             " j/k select   Enter focus   p prompt   A attention   1–7 views   ? help   q detach "
         } else {
-            " Input is passing directly to the agent · Ctrl-\\ returns to navigation "
+            " Input is passing directly to the agent · Ctrl-\\ or F12 returns to navigation "
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -1033,6 +1033,12 @@ const fn view_label(view: View) -> &'static str {
     }
 }
 
+fn is_navigation_toggle(key: KeyEvent) -> bool {
+    key.code == KeyCode::F(12)
+        || (key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('\\' | '4')))
+}
+
 fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
     match key.code {
         KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1071,6 +1077,22 @@ mod tests {
             key_to_bytes(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             vec![3]
         );
+    }
+
+    #[test]
+    fn navigation_toggle_accepts_unix_control_backslash_encoding() {
+        assert!(is_navigation_toggle(KeyEvent::new(
+            KeyCode::Char('4'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_navigation_toggle(KeyEvent::new(
+            KeyCode::Char('\\'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_navigation_toggle(KeyEvent::new(
+            KeyCode::F(12),
+            KeyModifiers::NONE
+        )));
     }
 
     #[test]

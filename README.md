@@ -46,7 +46,7 @@ muxloom list --json
 muxloom doctor
 ```
 
-`Ctrl-\` toggles between agent focus and navigation. In navigation mode:
+`Ctrl-\` toggles between agent focus and navigation. `F12` is a fallback for terminals that reserve or remap control characters. In navigation mode:
 
 | Key | Action |
 | --- | --- |
