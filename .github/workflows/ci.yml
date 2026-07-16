@@ -40,7 +40,7 @@ jobs:
           - image: debian:12
             setup: apt-get update && apt-get install -y curl build-essential pkg-config ca-certificates
           - image: rockylinux:9
-            setup: dnf install -y curl gcc gcc-c++ make pkgconf-pkg-config ca-certificates
+            setup: dnf install -y gcc gcc-c++ make pkgconf-pkg-config ca-certificates
     container: ${{ matrix.image }}
     steps:
       - run: ${{ matrix.setup }}
