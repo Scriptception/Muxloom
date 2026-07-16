@@ -394,6 +394,12 @@ impl App {
         self.selected_pane().map(|pane| pane.id.clone())
     }
 
+    pub fn selected_running_pane_id(&self) -> Option<String> {
+        self.selected_pane()
+            .filter(|pane| pane.exited_at.is_none() && pane.state != AgentState::Exited)
+            .map(|pane| pane.id.clone())
+    }
+
     pub fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
         frame.render_widget(Block::default().style(Style::default().bg(INK)), area);
@@ -1142,6 +1148,7 @@ mod tests {
                 Vec::new(),
                 HermesSnapshot::default(),
             );
+            assert_eq!(app.selected_running_pane_id().as_deref(), Some("pane-id"));
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal.draw(|frame| app.render(frame)).unwrap();
@@ -1155,6 +1162,10 @@ mod tests {
             assert!(rendered.contains("MUXLOOM"));
             assert!(rendered.contains("codex-api"));
             assert!(rendered.contains("NAV"));
+
+            app.workspaces[0].panes[0].state = AgentState::Exited;
+            app.workspaces[0].panes[0].exited_at = Some(Utc::now());
+            assert_eq!(app.selected_running_pane_id(), None);
         }
     }
 }

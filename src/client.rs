@@ -141,7 +141,7 @@ pub async fn attach(paths: &AppPaths, workspace_id: String, readonly: bool) -> R
                         }
                     }
                     Event::Resize(columns, rows) => {
-                        if let Some(pane_id) = app.selected_pane_id() {
+                        if let Some(pane_id) = app.selected_running_pane_id() {
                             write_frame(&mut writer, &Request::Resize {
                                 pane_id,
                                 rows: rows.saturating_sub(7),

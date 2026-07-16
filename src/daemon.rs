@@ -178,8 +178,14 @@ async fn handle_client(
                         write_frame(&mut writer, &Response::Error { message: "client is attached read-only".into() }).await?;
                         continue;
                     }
-                    if let Some(response) = dispatch(request, &state, &updates, &runtime_tx).await? {
-                        write_frame(&mut writer, &response).await?;
+                    match dispatch(request, &state, &updates, &runtime_tx).await {
+                        Ok(Some(response)) => write_frame(&mut writer, &response).await?,
+                        Ok(None) => {}
+                        Err(problem) => {
+                            write_frame(&mut writer, &Response::Error {
+                                message: problem.to_string(),
+                            }).await?;
+                        }
                     }
                 }
                 update = subscription.recv() => {
@@ -195,8 +201,18 @@ async fn handle_client(
         }
     }
 
-    if let Some(response) = dispatch(first, &state, &updates, &runtime_tx).await? {
-        write_frame(&mut writer, &response).await?;
+    match dispatch(first, &state, &updates, &runtime_tx).await {
+        Ok(Some(response)) => write_frame(&mut writer, &response).await?,
+        Ok(None) => {}
+        Err(problem) => {
+            write_frame(
+                &mut writer,
+                &Response::Error {
+                    message: problem.to_string(),
+                },
+            )
+            .await?;
+        }
     }
     Ok(())
 }
