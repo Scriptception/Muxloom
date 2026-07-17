@@ -1,0 +1,59 @@
+[package]
+name = "muxloom"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.96"
+description = "A native, SSH-first terminal multiplexer and control plane for AI agents"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Scriptception/Muxloom"
+keywords = ["terminal", "multiplexer", "tui", "ai-agents", "ssh"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "muxloom"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+ciborium = "0.2"
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+clap_mangen = "0.2"
+cron = "0.15"
+crossterm = { version = "0.29", features = ["event-stream"] }
+directories = "6"
+futures-util = "0.3"
+libc = "0.2"
+nix = { version = "0.30", features = ["user", "signal"] }
+portable-pty = "0.9"
+ratatui = "0.30"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shell-words = "1"
+sysinfo = "0.37"
+tokio = { version = "1", features = ["full"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+vt100 = "0.16"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "allow"

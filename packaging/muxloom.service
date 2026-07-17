@@ -1,0 +1,12 @@
+[Unit]
+Description=Muxloom terminal multiplexer daemon
+Documentation=https://github.com/Scriptception/Muxloom
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/muxloom daemon --foreground
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

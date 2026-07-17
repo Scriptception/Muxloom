@@ -1,0 +1,16 @@
+name: muxloom
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${MUXLOOM_VERSION}
+section: utils
+priority: optional
+maintainer: Scriptception <joshuarussell.online@gmail.com>
+description: Native SSH-first terminal multiplexer for AI agents
+license: MIT OR Apache-2.0
+contents:
+  - src: ${MUXLOOM_BINARY}
+    dst: /usr/bin/muxloom
+  - src: packaging/muxloom.service
+    dst: /usr/lib/systemd/user/muxloom.service
+  - src: target/muxloom.1
+    dst: /usr/share/man/man1/muxloom.1

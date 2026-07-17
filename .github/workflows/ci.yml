@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main, agent/initial-alpha]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.96.0
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets
+      - name: Fuzz frame decoder
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+          cargo +nightly fuzz run frame_decode --fuzz-dir fuzz -- -max_total_time=15
+      - run: cargo build --release --locked
+
+  distro-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ubuntu:22.04
+            setup: apt-get update && apt-get install -y curl build-essential pkg-config ca-certificates
+          - image: debian:12
+            setup: apt-get update && apt-get install -y curl build-essential pkg-config ca-certificates
+          - image: rockylinux:9
+            setup: dnf install -y gcc gcc-c++ make pkgconf-pkg-config ca-certificates
+    container: ${{ matrix.image }}
+    steps:
+      - run: ${{ matrix.setup }}
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Install and smoke test
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.96.0
+          . "$HOME/.cargo/env"
+          cargo build --locked
+          target/debug/muxloom --version
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/config" XDG_STATE_HOME="$RUNNER_TEMP/state" XDG_RUNTIME_DIR="$RUNNER_TEMP/run"
+          mkdir -p "$XDG_RUNTIME_DIR"
+          target/debug/muxloom server start
+          target/debug/muxloom new --detach --name smoke -- sh -c 'printf ready; sleep 2'
+          target/debug/muxloom list --json
+          target/debug/muxloom server stop --force
+
+  dependency-policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
