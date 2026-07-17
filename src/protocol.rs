@@ -5,15 +5,23 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::model::{
-    AgentState, AttentionEvent, EventConfidence, ScheduleRecord, UsageSnapshot, WorkspaceSummary,
+    AgentState, AttentionEvent, EventConfidence, LayoutNode, ScheduleRecord, SplitAxis,
+    UsageSnapshot, WorkspaceSummary,
 };
 
-pub const PROTOCOL_VERSION: u16 = 2;
-const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub const PROTOCOL_VERSION: u16 = 4;
+pub const MIN_PROTOCOL_VERSION: u16 = 3;
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub const REPLAY_CHUNK_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum Request {
+    Hello {
+        min_version: u16,
+        max_version: u16,
+        client_version: String,
+    },
     Ping {
         protocol_version: u16,
     },
@@ -21,12 +29,15 @@ pub enum Request {
         name: String,
         cwd: String,
         command: Vec<String>,
+        respawn: bool,
     },
     CreatePane {
         workspace_id: String,
         cwd: String,
         command: Vec<String>,
         title: Option<String>,
+        split_from: Option<String>,
+        split_axis: Option<SplitAxis>,
     },
     List,
     Attach {
@@ -49,8 +60,25 @@ pub enum Request {
         pane_id: String,
         lines: usize,
     },
+    ResyncPane {
+        pane_id: String,
+    },
     ClosePane {
         pane_id: String,
+    },
+    RenameWorkspace {
+        workspace_id: String,
+        name: String,
+    },
+    DeleteWorkspace {
+        workspace_id: String,
+    },
+    PruneExited {
+        workspace_id: Option<String>,
+    },
+    SetLayout {
+        workspace_id: String,
+        layout: LayoutNode,
     },
     AgentEvent {
         pane_id: String,
@@ -63,12 +91,20 @@ pub enum Request {
     MarkAttentionRead {
         id: String,
     },
+    MarkAllAttentionRead,
+    DismissAttention {
+        id: String,
+    },
     ListSchedules,
     CreateSchedule {
         schedule: ScheduleRecord,
     },
     DeleteSchedule {
         id: String,
+    },
+    SetScheduleEnabled {
+        id: String,
+        enabled: bool,
     },
     RunSchedule {
         id: String,
@@ -79,6 +115,11 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "response", rename_all = "snake_case")]
 pub enum Response {
+    Hello {
+        protocol_version: u16,
+        min_version: u16,
+        server_version: String,
+    },
     Pong {
         protocol_version: u16,
         version: String,
@@ -93,17 +134,33 @@ pub enum Response {
     StateSnapshot {
         workspaces: Vec<WorkspaceSummary>,
         attention: Vec<AttentionEvent>,
+        /// Kept empty for protocol-v3 compatibility; usage has no v1 TUI surface.
         usage: Vec<UsageSnapshot>,
     },
     Output {
+        workspace_id: String,
         pane_id: String,
         data: Vec<u8>,
+        sequence: u64,
+    },
+    PaneSnapshot {
+        pane_id: String,
+        data: Vec<u8>,
+        /// The next live output sequence after this complete snapshot.
+        sequence: u64,
+        reset: bool,
     },
     PaneUpdated {
         workspace: WorkspaceSummary,
     },
     Attention {
         event: AttentionEvent,
+    },
+    AttentionSnapshot {
+        attention: Vec<AttentionEvent>,
+    },
+    WorkspaceRemoved {
+        workspace_id: String,
     },
     Capture {
         pane_id: String,
@@ -112,6 +169,20 @@ pub enum Response {
     Schedules {
         schedules: Vec<ScheduleRecord>,
     },
+    ShutdownComplete {
+        terminated_panes: usize,
+    },
+    ServerStopping,
+}
+
+pub fn negotiate_protocol(client_min: u16, client_max: u16) -> Result<u16> {
+    let negotiated = client_max.min(PROTOCOL_VERSION);
+    if negotiated < client_min || negotiated < MIN_PROTOCOL_VERSION {
+        bail!(
+            "protocol mismatch: client supports {client_min}..={client_max}, daemon supports {MIN_PROTOCOL_VERSION}..={PROTOCOL_VERSION}; finish active work, stop the old daemon, and retry"
+        );
+    }
+    Ok(negotiated)
 }
 
 pub async fn write_frame<W, T>(writer: &mut W, value: &T) -> Result<()>
@@ -175,5 +246,12 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION
             }
         ));
+    }
+
+    #[test]
+    fn incompatible_protocol_has_actionable_error() {
+        let problem = negotiate_protocol(1, 2).unwrap_err().to_string();
+        assert!(problem.contains("client supports 1..=2"));
+        assert!(problem.contains("stop the old daemon"));
     }
 }

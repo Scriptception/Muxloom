@@ -10,15 +10,6 @@ pub struct ConfigSource {
     pub writable: bool,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct HermesSnapshot {
-    pub available: bool,
-    pub version: String,
-    pub status: String,
-    pub sessions: String,
-    pub insights: String,
-}
-
 pub fn discover_skills() -> Vec<SkillRecord> {
     let Some(home) = directories::BaseDirs::new().map(|base| base.home_dir().to_path_buf()) else {
         return Vec::new();
@@ -86,22 +77,6 @@ pub fn config_sources(muxloom: PathBuf) -> Vec<ConfigSource> {
         location,
     })
     .collect()
-}
-
-pub fn hermes_snapshot() -> HermesSnapshot {
-    let available = std::env::var_os("PATH").is_some_and(|directories| {
-        std::env::split_paths(&directories).any(|directory| directory.join("hermes").is_file())
-    });
-    if !available {
-        return HermesSnapshot::default();
-    }
-    HermesSnapshot {
-        available: true,
-        version: "installed".into(),
-        status: "Use `muxloom hermes status` for a live health snapshot.".into(),
-        sessions: "Use `muxloom hermes sessions` to inspect recent sessions.".into(),
-        insights: "Use `muxloom hermes insights` for the seven-day report.".into(),
-    }
 }
 
 pub fn git_summary(cwd: &str) -> String {

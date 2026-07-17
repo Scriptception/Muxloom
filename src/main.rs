@@ -9,13 +9,13 @@ mod ui;
 
 use std::{
     fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 use crate::{
@@ -42,6 +42,30 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Rename, kill, prune, or inspect a workspace.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
+    /// Rename a workspace (shortcut for `workspace rename`).
+    Rename { workspace: String, name: String },
+    /// Terminate and remove a workspace (shortcut for `workspace kill`).
+    Kill {
+        workspace: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove exited pane history (shortcut for `workspace prune`).
+    Prune { workspace: Option<String> },
+    /// Inspect and update the persisted attention queue.
+    Attention {
+        #[command(subcommand)]
+        command: AttentionCommand,
+    },
+    /// Generate shell completions on stdout.
+    Completions { shell: clap_complete::Shell },
+    /// Generate the muxloom(1) manual page on stdout.
+    Man,
     /// Send text or stdin to a pane without shell evaluation.
     Send(SendArgs),
     /// Capture recent output from a pane.
@@ -106,6 +130,9 @@ struct NewArgs {
     /// Create the workspace without opening the interactive TUI.
     #[arg(short, long)]
     detach: bool,
+    /// Relaunch the command after a daemon restart.
+    #[arg(long)]
+    respawn: bool,
     #[arg(last = true)]
     command: Vec<String>,
 }
@@ -115,8 +142,42 @@ struct AttachArgs {
     workspace: Option<String>,
     #[arg(long)]
     readonly: bool,
-    #[arg(long)]
-    takeover: bool,
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCommand {
+    Rename {
+        workspace: String,
+        name: String,
+    },
+    Kill {
+        workspace: String,
+        #[arg(long)]
+        force: bool,
+    },
+    Prune {
+        workspace: Option<String>,
+    },
+    Layout {
+        workspace: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AttentionCommand {
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Read {
+        id: String,
+    },
+    ReadAll,
+    Dismiss {
+        id: String,
+    },
 }
 
 #[derive(Args)]
@@ -197,6 +258,12 @@ enum ScheduleCommand {
     Run {
         id: String,
     },
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -256,7 +323,10 @@ enum SetupProvider {
 enum ServerCommand {
     Start,
     Status,
-    Stop,
+    Stop {
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[tokio::main]
@@ -271,6 +341,30 @@ async fn main() -> Result<()> {
         Some(Command::New(arguments)) => new_workspace(&paths, arguments).await,
         Some(Command::Attach(arguments)) => attach_workspace(&paths, arguments).await,
         Some(Command::List { json }) => list_workspaces(&paths, json).await,
+        Some(Command::Workspace { command }) => workspace_command(&paths, command).await,
+        Some(Command::Rename { workspace, name }) => {
+            workspace_command(&paths, WorkspaceCommand::Rename { workspace, name }).await
+        }
+        Some(Command::Kill { workspace, force }) => {
+            workspace_command(&paths, WorkspaceCommand::Kill { workspace, force }).await
+        }
+        Some(Command::Prune { workspace }) => {
+            workspace_command(&paths, WorkspaceCommand::Prune { workspace }).await
+        }
+        Some(Command::Attention { command }) => attention_command(&paths, command).await,
+        Some(Command::Completions { shell }) => {
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "muxloom",
+                &mut std::io::stdout(),
+            );
+            Ok(())
+        }
+        Some(Command::Man) => {
+            clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+            Ok(())
+        }
         Some(Command::Send(arguments)) => send_input(&paths, arguments).await,
         Some(Command::Capture { pane, lines }) => capture(&paths, pane, lines).await,
         Some(Command::Doctor { json }) => doctor(&paths, json).await,
@@ -287,7 +381,6 @@ async fn main() -> Result<()> {
                 AttachArgs {
                     workspace: None,
                     readonly: false,
-                    takeover: false,
                 },
             )
             .await
@@ -296,6 +389,7 @@ async fn main() -> Result<()> {
 }
 
 async fn new_workspace(paths: &AppPaths, arguments: NewArgs) -> Result<()> {
+    client::ensure_daemon(paths).await?;
     let cwd = arguments
         .cwd
         .unwrap_or(std::env::current_dir().context("read current directory")?);
@@ -305,6 +399,7 @@ async fn new_workspace(paths: &AppPaths, arguments: NewArgs) -> Result<()> {
             name: arguments.name,
             cwd: cwd.display().to_string(),
             command: arguments.command,
+            respawn: arguments.respawn,
         },
     )
     .await?;
@@ -323,6 +418,7 @@ async fn new_workspace(paths: &AppPaths, arguments: NewArgs) -> Result<()> {
 }
 
 async fn attach_workspace(paths: &AppPaths, arguments: AttachArgs) -> Result<()> {
+    client::ensure_daemon(paths).await?;
     let response = client::request(paths, Request::List).await?;
     let Response::StateSnapshot { workspaces, .. } = response else {
         bail!("unable to list workspaces");
@@ -334,6 +430,7 @@ async fn attach_workspace(paths: &AppPaths, arguments: AttachArgs) -> Result<()>
                 name: "workspace".into(),
                 cwd: None,
                 detach: false,
+                respawn: false,
                 command: Vec::new(),
             },
         )
@@ -350,12 +447,7 @@ async fn attach_workspace(paths: &AppPaths, arguments: AttachArgs) -> Result<()>
             },
         )
         .ok_or_else(|| anyhow!("workspace was not found"))?;
-    client::attach(
-        paths,
-        workspace.id.clone(),
-        arguments.readonly && !arguments.takeover,
-    )
-    .await
+    client::attach(paths, workspace.id.clone(), arguments.readonly).await
 }
 
 async fn list_workspaces(paths: &AppPaths, json: bool) -> Result<()> {
@@ -389,6 +481,99 @@ async fn list_workspaces(paths: &AppPaths, json: bool) -> Result<()> {
         other => bail!("unexpected daemon response: {other:?}"),
     }
     Ok(())
+}
+
+async fn resolve_workspace(paths: &AppPaths, requested: &str) -> Result<model::WorkspaceSummary> {
+    let Response::StateSnapshot { workspaces, .. } = client::request(paths, Request::List).await?
+    else {
+        bail!("unable to list workspaces");
+    };
+    workspaces
+        .into_iter()
+        .find(|workspace| workspace.id.starts_with(requested) || workspace.name == requested)
+        .ok_or_else(|| anyhow!("workspace was not found: {requested}"))
+}
+
+async fn workspace_command(paths: &AppPaths, command: WorkspaceCommand) -> Result<()> {
+    let request = match command {
+        WorkspaceCommand::Rename { workspace, name } => Request::RenameWorkspace {
+            workspace_id: resolve_workspace(paths, &workspace).await?.id,
+            name,
+        },
+        WorkspaceCommand::Kill { workspace, force } => {
+            let workspace = resolve_workspace(paths, &workspace).await?;
+            let live = workspace
+                .panes
+                .iter()
+                .filter(|pane| pane.exited_at.is_none() && !pane.daemon_lost)
+                .count();
+            if live > 0 && !force {
+                bail!(
+                    "workspace {} owns {live} live pane(s); rerun with --force to terminate them",
+                    workspace.name
+                );
+            }
+            Request::DeleteWorkspace {
+                workspace_id: workspace.id,
+            }
+        }
+        WorkspaceCommand::Prune { workspace } => Request::PruneExited {
+            workspace_id: match workspace {
+                Some(workspace) => Some(resolve_workspace(paths, &workspace).await?.id),
+                None => None,
+            },
+        },
+        WorkspaceCommand::Layout { workspace, json } => {
+            let workspace = resolve_workspace(paths, &workspace).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&workspace.layout)?);
+            } else {
+                println!("{:#?}", workspace.layout);
+            }
+            return Ok(());
+        }
+    };
+    match client::request(paths, request).await? {
+        Response::Ok
+        | Response::PaneUpdated { .. }
+        | Response::WorkspaceRemoved { .. }
+        | Response::StateSnapshot { .. } => Ok(()),
+        Response::Error { message } => bail!(message),
+        response => bail!("unexpected daemon response: {response:?}"),
+    }
+}
+
+async fn attention_command(paths: &AppPaths, command: AttentionCommand) -> Result<()> {
+    let request = match command {
+        AttentionCommand::List { json } => {
+            let Response::AttentionSnapshot { attention } =
+                client::request(paths, Request::ListAttention).await?
+            else {
+                bail!("unable to list attention");
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&attention)?);
+            } else {
+                for event in attention.iter().filter(|event| event.read_at.is_none()) {
+                    println!(
+                        "{}  {:<10} {}",
+                        &event.id[..8],
+                        event.kind.label(),
+                        event.summary
+                    );
+                }
+            }
+            return Ok(());
+        }
+        AttentionCommand::Read { id } => Request::MarkAttentionRead { id },
+        AttentionCommand::ReadAll => Request::MarkAllAttentionRead,
+        AttentionCommand::Dismiss { id } => Request::DismissAttention { id },
+    };
+    match client::request(paths, request).await? {
+        Response::Ok | Response::AttentionSnapshot { .. } => Ok(()),
+        Response::Error { message } => bail!(message),
+        response => bail!("unexpected daemon response: {response:?}"),
+    }
 }
 
 async fn send_input(paths: &AppPaths, arguments: SendArgs) -> Result<()> {
@@ -437,6 +622,11 @@ async fn capture(paths: &AppPaths, pane: String, lines: usize) -> Result<()> {
 }
 
 async fn doctor(paths: &AppPaths, json: bool) -> Result<()> {
+    let config = config::Config::load_or_create(paths)?;
+    let home = directories::BaseDirs::new().context("cannot determine home directory")?;
+    let codex_hooks = hook_installation_valid(&home.home_dir().join(".codex/hooks.json"), "codex");
+    let claude_hooks =
+        hook_installation_valid(&home.home_dir().join(".claude/settings.json"), "claude");
     let daemon = matches!(
         client::request(
             paths,
@@ -461,6 +651,9 @@ async fn doctor(paths: &AppPaths, json: bool) -> Result<()> {
         "codex": which("codex"),
         "claude": which("claude"),
         "hermes": which("hermes"),
+        "codex_hooks": codex_hooks,
+        "claude_hooks": claude_hooks,
+        "effective_keymap": &config.keymap,
         "web_listener": false,
     });
     if json {
@@ -475,9 +668,63 @@ async fn doctor(paths: &AppPaths, json: bool) -> Result<()> {
         println!("  Codex           {}", checks["codex"]);
         println!("  Claude          {}", checks["claude"]);
         println!("  Hermes          {}", checks["hermes"]);
+        println!(
+            "  Codex hooks     {}",
+            if codex_hooks {
+                "configured"
+            } else {
+                "missing or drifted"
+            }
+        );
+        println!(
+            "  Claude hooks    {}",
+            if claude_hooks {
+                "configured"
+            } else {
+                "missing or drifted"
+            }
+        );
+        println!("  mode toggle     {}", config.keymap.toggle_mode);
         println!("  network         local Unix socket only");
     }
     Ok(())
+}
+
+fn hook_installation_valid(location: &Path, marker: &str) -> bool {
+    fs::read_to_string(location)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        .is_some_and(|value| {
+            value.to_string().contains(&format!("--provider {marker}"))
+                || value
+                    .get("hooks")
+                    .into_iter()
+                    .flat_map(|hooks| {
+                        hooks
+                            .as_object()
+                            .into_iter()
+                            .flat_map(|hooks| hooks.values())
+                    })
+                    .flat_map(|groups| groups.as_array().into_iter().flatten())
+                    .flat_map(|group| {
+                        group
+                            .get("hooks")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                    })
+                    .any(|handler| {
+                        handler
+                            .get("args")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|args| {
+                                args.windows(2).any(|pair| {
+                                    pair[0].as_str() == Some("--provider")
+                                        && pair[1].as_str() == Some(marker)
+                                })
+                            })
+                    })
+        })
 }
 
 fn config_command(paths: &AppPaths, command: Option<ConfigCommand>) -> Result<()> {
@@ -499,9 +746,14 @@ fn config_command(paths: &AppPaths, command: Option<ConfigCommand>) -> Result<()
         Some(ConfigCommand::Sources) => {
             for source in integrations::config_sources(paths.config()) {
                 println!(
-                    "{:<10} {:<8} {}",
+                    "{:<10} {:<8} {:<9} {}",
                     source.provider,
                     if source.present { "present" } else { "missing" },
+                    if source.writable {
+                        "writable"
+                    } else {
+                        "read-only"
+                    },
                     source.location.display()
                 );
             }
@@ -570,6 +822,7 @@ fn hermes_command(command: HermesCommand) -> Result<()> {
 }
 
 async fn schedule_command(paths: &AppPaths, command: ScheduleCommand) -> Result<()> {
+    client::ensure_daemon(paths).await?;
     let request = match command {
         ScheduleCommand::List { json } => {
             let response = client::request(paths, Request::ListSchedules).await?;
@@ -615,9 +868,11 @@ async fn schedule_command(paths: &AppPaths, command: ScheduleCommand) -> Result<
         },
         ScheduleCommand::Remove { id } => Request::DeleteSchedule { id },
         ScheduleCommand::Run { id } => Request::RunSchedule { id },
+        ScheduleCommand::Enable { id } => Request::SetScheduleEnabled { id, enabled: true },
+        ScheduleCommand::Disable { id } => Request::SetScheduleEnabled { id, enabled: false },
     };
     match client::request(paths, request).await? {
-        Response::Ok | Response::WorkspaceCreated { .. } => Ok(()),
+        Response::Ok | Response::WorkspaceCreated { .. } | Response::Schedules { .. } => Ok(()),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected daemon response: {other:?}"),
     }
@@ -625,17 +880,32 @@ async fn schedule_command(paths: &AppPaths, command: ScheduleCommand) -> Result<
 
 async fn hook(paths: &AppPaths, arguments: HookArgs) -> Result<()> {
     let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
-    let payload: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
-    let pane_id = arguments
-        .pane
-        .or_else(|| std::env::var("MUXLOOM_PANE_ID").ok())
-        .or_else(|| {
-            payload
-                .get("pane_id")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned)
-        });
+    std::io::stdin()
+        .take(1_048_577)
+        .read_to_string(&mut input)?;
+    if input.len() > 1_048_576 {
+        return Ok(());
+    }
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&input) else {
+        return Ok(());
+    };
+    if !payload.is_object() {
+        return Ok(());
+    }
+    let environment_pane = std::env::var("MUXLOOM_PANE_ID").ok();
+    let payload_pane = payload.get("pane_id").and_then(|value| value.as_str());
+    let pane_id = environment_pane.as_ref().and_then(|trusted| {
+        arguments
+            .pane
+            .as_deref()
+            .is_none_or(|candidate| candidate == trusted)
+            .then_some(())
+            .and_then(|()| {
+                payload_pane
+                    .is_none_or(|candidate| candidate == trusted)
+                    .then(|| trusted.clone())
+            })
+    });
     let Some(pane_id) = pane_id else {
         return Ok(());
     };
@@ -643,8 +913,8 @@ async fn hook(paths: &AppPaths, arguments: HookArgs) -> Result<()> {
         .get("hook_event_name")
         .and_then(|value| value.as_str())
         .unwrap_or_default();
-    let state = arguments
-        .state
+    let explicit_state = arguments.state;
+    let state = explicit_state
         .map(hook_state)
         .unwrap_or_else(|| infer_hook_state(event_name, &payload));
     let summary = arguments.summary.unwrap_or_else(|| {
@@ -654,16 +924,21 @@ async fn hook(paths: &AppPaths, arguments: HookArgs) -> Result<()> {
             .unwrap_or(event_name)
             .to_string()
     });
+    let summary = summary
+        .replace(['\r', '\n'], " ")
+        .chars()
+        .take(512)
+        .collect::<String>();
     let _ = tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        client::request(
+        client::request_passive(
             paths,
             Request::AgentEvent {
                 pane_id,
                 provider: arguments.provider,
                 state,
                 summary,
-                confidence: EventConfidence::Native,
+                confidence: EventConfidence::HookDerived,
             },
         ),
     )
@@ -720,8 +995,22 @@ async fn server_command(paths: &AppPaths, command: ServerCommand) -> Result<()> 
             println!("{response:?}");
             Ok(())
         }
-        ServerCommand::Stop => {
-            let _ = client::stop_daemon(paths).await;
+        ServerCommand::Stop { force } => {
+            let live = match client::request(paths, Request::List).await? {
+                Response::StateSnapshot { workspaces, .. } => workspaces
+                    .into_iter()
+                    .flat_map(|workspace| workspace.panes)
+                    .filter(|pane| pane.exited_at.is_none() && !pane.daemon_lost)
+                    .count(),
+                _ => 0,
+            };
+            if live > 0 && !force {
+                bail!(
+                    "daemon owns {live} live pane(s); rerun with `muxloom server stop --force` to terminate them"
+                );
+            }
+            let terminated = client::stop_daemon(paths).await?;
+            println!("Stopped Muxloom daemon; terminated {terminated} pane(s).");
             Ok(())
         }
     }
@@ -759,24 +1048,52 @@ fn infer_hook_state(event: &str, payload: &serde_json::Value) -> AgentState {
 }
 
 fn codex_hook(executable: &str) -> serde_json::Value {
+    let handler = || {
+        serde_json::json!({
+            "type": "command",
+            "command": executable,
+            "args": ["hook", "--provider", "codex"],
+            "timeout": 5
+        })
+    };
     serde_json::json!({
         "hooks": {
-            "PermissionRequest": [{"hooks": [{"type": "command", "command": format!("{executable} hook --provider codex")}]}],
-            "Stop": [{"hooks": [{"type": "command", "command": format!("{executable} hook --provider codex")}]}]
+            "SessionStart": [{"hooks": [handler()]}],
+            "PermissionRequest": [{"hooks": [handler()]}],
+            "PostToolUse": [{"hooks": [handler()]}],
+            "Stop": [{"hooks": [handler()]}]
         }
     })
 }
 
 fn claude_hook(executable: &str) -> serde_json::Value {
+    let handler = || {
+        serde_json::json!({
+            "type": "command",
+            "command": executable,
+            "args": ["hook", "--provider", "claude"],
+            "timeout": 5
+        })
+    };
     serde_json::json!({
         "hooks": {
-            "Notification": [{"matcher": "permission_prompt|idle_prompt", "hooks": [{"type": "command", "command": format!("{executable} hook --provider claude")}]}],
-            "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": format!("{executable} hook --provider claude")}]}]
+            "Notification": [
+                {"matcher": "permission_prompt", "hooks": [handler()]},
+                {"matcher": "idle_prompt|agent_needs_input", "hooks": [handler()]}
+            ],
+            "PermissionRequest": [{"matcher": "*", "hooks": [handler()]}],
+            "Stop": [{"hooks": [handler()]}]
         }
     })
 }
 
 fn merge_hook_config(location: &Path, addition: &serde_json::Value) -> Result<()> {
+    if fs::symlink_metadata(location).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        bail!(
+            "refusing to update symlinked hook configuration: {}",
+            location.display()
+        );
+    }
     let mut existing = if location.exists() {
         serde_json::from_str::<serde_json::Value>(&fs::read_to_string(location)?)
             .with_context(|| format!("parse {}", location.display()))?
@@ -812,11 +1129,17 @@ fn merge_hook_config(location: &Path, addition: &serde_json::Value) -> Result<()
         ));
         fs::copy(location, backup)?;
     }
-    let temporary = location.with_extension("json.tmp");
-    fs::write(
-        &temporary,
-        format!("{}\n", serde_json::to_string_pretty(&existing)?),
-    )?;
+    let temporary = parent.join(format!(".muxloom-hooks-{}.tmp", Uuid::new_v4()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    file.write_all(format!("{}\n", serde_json::to_string_pretty(&existing)?).as_bytes())?;
+    file.sync_all()?;
     fs::rename(temporary, location)?;
     Ok(())
 }
@@ -847,7 +1170,16 @@ fn edit_config(paths: &AppPaths, provider: ConfigProvider) -> Result<()> {
     if !location.exists() {
         bail!("configuration does not exist: {}", location.display());
     }
-    let temporary = location.with_extension(format!("{format}.muxloom-edit"));
+    if fs::symlink_metadata(&location)?.file_type().is_symlink() {
+        bail!(
+            "refusing to edit symlinked configuration: {}",
+            location.display()
+        );
+    }
+    let temporary = location
+        .parent()
+        .context("config has no parent")?
+        .join(format!(".muxloom-edit-{}.{}", Uuid::new_v4(), format));
     fs::copy(&location, &temporary)?;
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
     let mut editor_parts = shell_words::split(&editor).context("parse EDITOR")?;
