@@ -26,6 +26,11 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets
+      - name: Fuzz frame decoder
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+          cargo +nightly fuzz run frame_decode --fuzz-dir fuzz -- -max_total_time=15
       - run: cargo build --release --locked
 
   distro-smoke:
@@ -52,6 +57,12 @@ jobs:
           . "$HOME/.cargo/env"
           cargo build --locked
           target/debug/muxloom --version
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/config" XDG_STATE_HOME="$RUNNER_TEMP/state" XDG_RUNTIME_DIR="$RUNNER_TEMP/run"
+          mkdir -p "$XDG_RUNTIME_DIR"
+          target/debug/muxloom server start
+          target/debug/muxloom new --detach --name smoke -- sh -c 'printf ready; sleep 2'
+          target/debug/muxloom list --json
+          target/debug/muxloom server stop --force
 
   dependency-policy:
     runs-on: ubuntu-24.04

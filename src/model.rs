@@ -66,7 +66,45 @@ pub struct PaneSummary {
     pub progress: Option<Progress>,
     pub started_at: DateTime<Utc>,
     pub exited_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub exit_status: Option<i32>,
+    #[serde(default)]
+    pub daemon_lost: bool,
     pub unread: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitAxis {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "node", rename_all = "snake_case")]
+pub enum LayoutNode {
+    Pane {
+        pane_id: String,
+    },
+    Split {
+        axis: SplitAxis,
+        /// Percentage assigned to the first child, clamped to 10..=90.
+        ratio: u8,
+        first: Box<LayoutNode>,
+        second: Box<LayoutNode>,
+    },
+}
+
+impl LayoutNode {
+    pub fn pane_ids(&self, target: &mut Vec<String>) {
+        match self {
+            Self::Pane { pane_id } => target.push(pane_id.clone()),
+            Self::Split { first, second, .. } => {
+                first.pane_ids(target);
+                second.pane_ids(target);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +113,12 @@ pub struct WorkspaceSummary {
     pub name: String,
     pub created_at: DateTime<Utc>,
     pub panes: Vec<PaneSummary>,
+    #[serde(default)]
+    pub layout: Option<LayoutNode>,
+    #[serde(default)]
+    pub respawn: bool,
+    #[serde(default)]
+    pub schedule_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

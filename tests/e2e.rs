@@ -1,21 +1,66 @@
-use std::{process::Command, thread, time::Duration};
+use std::{
+    ffi::OsStr,
+    process::Command,
+    thread,
+    time::{Duration, Instant},
+};
+
+struct TestDaemon<'a> {
+    binary: &'a str,
+    runtime: std::path::PathBuf,
+    state: std::path::PathBuf,
+    config: std::path::PathBuf,
+}
+
+impl TestDaemon<'_> {
+    fn command(&self) -> Command {
+        let mut command = Command::new(self.binary);
+        command.envs([
+            ("XDG_RUNTIME_DIR", self.runtime.as_os_str()),
+            ("XDG_STATE_HOME", self.state.as_os_str()),
+            ("XDG_CONFIG_HOME", self.config.as_os_str()),
+        ]);
+        command
+    }
+
+    fn wait_for(&self, needle: &str, pane_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let output = self
+                .command()
+                .args(["capture", "--pane", pane_id, "--lines", "20"])
+                .output()
+                .unwrap();
+            if output.status.success() && String::from_utf8_lossy(&output.stdout).contains(needle) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("pane never emitted {needle:?}");
+    }
+}
+
+impl Drop for TestDaemon<'_> {
+    fn drop(&mut self) {
+        let _ = self.command().args(["server", "stop", "--force"]).output();
+    }
+}
 
 #[test]
-fn detached_pty_can_be_listed_and_captured() {
+fn detached_pty_input_lifecycle_and_capture_work() {
     let binary = env!("CARGO_BIN_EXE_muxloom");
     let temporary = tempfile::tempdir().unwrap();
     let runtime = temporary.path().join("runtime");
-    let state = temporary.path().join("state");
-    let config = temporary.path().join("config");
     std::fs::create_dir_all(&runtime).unwrap();
-    let environment = [
-        ("XDG_RUNTIME_DIR", runtime.as_os_str()),
-        ("XDG_STATE_HOME", state.as_os_str()),
-        ("XDG_CONFIG_HOME", config.as_os_str()),
-    ];
+    let daemon = TestDaemon {
+        binary,
+        runtime,
+        state: temporary.path().join("state"),
+        config: temporary.path().join("config"),
+    };
 
-    let created = Command::new(binary)
-        .envs(environment)
+    let created = daemon
+        .command()
         .args([
             "new",
             "--detach",
@@ -24,7 +69,7 @@ fn detached_pty_can_be_listed_and_captured() {
             "--",
             "/bin/sh",
             "-lc",
-            "printf 'e2e-ready\\n'; sleep 10",
+            "printf 'e2e-ready\\n'; read line; printf 'got:%s\\n' \"$line\"; sleep 10",
         ])
         .output()
         .unwrap();
@@ -33,26 +78,57 @@ fn detached_pty_can_be_listed_and_captured() {
         "{}",
         String::from_utf8_lossy(&created.stderr)
     );
-    thread::sleep(Duration::from_millis(250));
 
-    let listed = Command::new(binary)
-        .envs(environment)
-        .args(["list", "--json"])
-        .output()
-        .unwrap();
+    let listed = daemon.command().args(["list", "--json"]).output().unwrap();
     assert!(listed.status.success());
     let workspaces: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
-    let pane_id = workspaces[0]["panes"][0]["id"].as_str().unwrap();
-    let captured = Command::new(binary)
-        .envs(environment)
-        .args(["capture", "--pane", pane_id, "--lines", "20"])
+    let pane_id = workspaces[0]["panes"][0]["id"].as_str().unwrap().to_owned();
+    daemon.wait_for("e2e-ready", &pane_id);
+
+    let sent = daemon
+        .command()
+        .args(["send", "--pane", &pane_id, "--enter", "hello"])
         .output()
         .unwrap();
-    assert!(captured.status.success());
-    assert!(String::from_utf8_lossy(&captured.stdout).contains("e2e-ready"));
+    assert!(
+        sent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    daemon.wait_for("got:hello", &pane_id);
 
-    let _ = Command::new(binary)
-        .envs(environment)
-        .args(["server", "stop"])
-        .output();
+    let renamed = daemon
+        .command()
+        .args(["workspace", "rename", "e2e", "renamed"])
+        .output()
+        .unwrap();
+    assert!(renamed.status.success());
+    let killed = daemon
+        .command()
+        .args(["workspace", "kill", "renamed", "--force"])
+        .output()
+        .unwrap();
+    assert!(
+        killed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+}
+
+#[test]
+fn passive_hook_does_not_start_a_stopped_daemon() {
+    let binary = env!("CARGO_BIN_EXE_muxloom");
+    let temporary = tempfile::tempdir().unwrap();
+    let runtime = temporary.path().join("runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let output = Command::new(binary)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", temporary.path().join("state"))
+        .env("XDG_CONFIG_HOME", temporary.path().join("config"))
+        .env("MUXLOOM_PANE_ID", OsStr::new("missing"))
+        .args(["hook", "--provider", "codex", "--state", "working"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(!runtime.join("muxloom/muxloom.sock").exists());
 }

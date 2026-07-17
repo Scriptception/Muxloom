@@ -19,7 +19,7 @@ impl AppPaths {
             .unwrap_or_else(|| base.home_dir().join(".local/state"))
             .join("muxloom");
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
+            .map(|directory| PathBuf::from(directory).join("muxloom"))
             .unwrap_or_else(|| PathBuf::from(format!("/tmp/muxloom-{}", current_uid())));
         Ok(Self {
             config_dir,
@@ -54,16 +54,7 @@ impl AppPaths {
 }
 
 fn current_uid() -> String {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|contents| {
-            contents
-                .lines()
-                .find(|line| line.starts_with("Uid:"))
-                .and_then(|line| line.split_whitespace().nth(1))
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "unknown".into())
+    nix::unistd::geteuid().as_raw().to_string()
 }
 
 #[cfg(unix)]

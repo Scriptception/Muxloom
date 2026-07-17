@@ -6,7 +6,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::{
-    event::{Event, EventStream},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -15,19 +18,25 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::{net::UnixStream, time::sleep};
 
 use crate::{
-    integrations::{config_sources, discover_skills, hermes_snapshot},
     paths::AppPaths,
-    protocol::{PROTOCOL_VERSION, Request, Response, read_frame, write_frame},
+    protocol::{
+        MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, Request, Response, read_frame, write_frame,
+    },
     ui::{Action, App},
 };
 
 pub async fn request(paths: &AppPaths, request: Request) -> Result<Response> {
-    ensure_daemon(paths).await?;
     let mut stream = UnixStream::connect(paths.socket())
         .await
         .context("connect to daemon")?;
+    handshake(&mut stream).await?;
     write_frame(&mut stream, &request).await?;
     read_frame(&mut stream).await
+}
+
+/// Connect without starting a daemon. Passive hooks must never resurrect a stopped service.
+pub async fn request_passive(paths: &AppPaths, passive_request: Request) -> Result<Response> {
+    request(paths, passive_request).await
 }
 
 pub async fn ensure_daemon(paths: &AppPaths) -> Result<()> {
@@ -82,6 +91,7 @@ async fn probe_daemon(paths: &AppPaths) -> Result<Response> {
     let mut stream = UnixStream::connect(paths.socket())
         .await
         .context("connect to daemon")?;
+    handshake(&mut stream).await?;
     write_frame(
         &mut stream,
         &Request::Ping {
@@ -92,18 +102,42 @@ async fn probe_daemon(paths: &AppPaths) -> Result<Response> {
     read_frame(&mut stream).await
 }
 
-pub async fn stop_daemon(paths: &AppPaths) -> Result<()> {
+async fn handshake(stream: &mut UnixStream) -> Result<()> {
+    write_frame(
+        stream,
+        &Request::Hello {
+            min_version: MIN_PROTOCOL_VERSION,
+            max_version: PROTOCOL_VERSION,
+            client_version: env!("CARGO_PKG_VERSION").into(),
+        },
+    )
+    .await?;
+    match read_frame::<_, Response>(stream).await? {
+        Response::Hello { .. } => Ok(()),
+        Response::Error { message } => bail!(message),
+        response => bail!("invalid daemon handshake: {response:?}"),
+    }
+}
+
+pub async fn stop_daemon(paths: &AppPaths) -> Result<usize> {
     let mut stream = UnixStream::connect(paths.socket())
         .await
         .context("connect to daemon")?;
-    write_frame(&mut stream, &Request::Shutdown).await
+    handshake(&mut stream).await?;
+    write_frame(&mut stream, &Request::Shutdown).await?;
+    match read_frame(&mut stream).await? {
+        Response::ShutdownComplete { terminated_panes } => Ok(terminated_panes),
+        Response::Error { message } => bail!(message),
+        response => bail!("unexpected shutdown response: {response:?}"),
+    }
 }
 
 pub async fn attach(paths: &AppPaths, workspace_id: String, readonly: bool) -> Result<()> {
     ensure_daemon(paths).await?;
-    let stream = UnixStream::connect(paths.socket())
+    let mut stream = UnixStream::connect(paths.socket())
         .await
         .context("connect to daemon")?;
+    handshake(&mut stream).await?;
     let (mut reader, mut writer) = stream.into_split();
     write_frame(
         &mut writer,
@@ -122,29 +156,44 @@ pub async fn attach(paths: &AppPaths, workspace_id: String, readonly: bool) -> R
     else {
         return Err(anyhow!("daemon rejected attach: {initial:?}"));
     };
+    let config = crate::config::Config::load_or_create(paths)?;
     let mut app = App::new(
         workspace_id,
         workspaces,
         attention,
         usage,
-        discover_skills(),
-        config_sources(paths.config()),
-        hermes_snapshot(),
+        Vec::new(),
+        Vec::new(),
+        Default::default(),
+        config,
     );
-    write_frame(&mut writer, &Request::ListSchedules).await?;
-
     enable_raw_mode().context("enable terminal raw mode")?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )
+    .context("enter alternate screen")?;
     let mut guard = TerminalGuard;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("create terminal")?;
     terminal.clear()?;
     let mut events = EventStream::new();
+    let mut redraw = tokio::time::interval(Duration::from_millis(16));
+    redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut dirty = true;
 
     loop {
-        terminal.draw(|frame| app.render(frame))?;
         tokio::select! {
+            _ = redraw.tick() => if dirty {
+                terminal.draw(|frame| app.render(frame))?;
+                for (pane_id, rows, cols) in app.take_resizes() {
+                    write_frame(&mut writer, &Request::Resize { pane_id, rows, cols }).await?;
+                }
+                dirty = false;
+            },
             server = read_frame::<_, Response>(&mut reader) => {
                 let response = server?;
                 let created_workspace = match &response {
@@ -152,6 +201,7 @@ pub async fn attach(paths: &AppPaths, workspace_id: String, readonly: bool) -> R
                     _ => None,
                 };
                 app.apply(response);
+                dirty = true;
                 if let Some(workspace_id) = created_workspace {
                     write_frame(&mut writer, &Request::SwitchWorkspace { workspace_id }).await?;
                 }
@@ -164,19 +214,18 @@ pub async fn attach(paths: &AppPaths, workspace_id: String, readonly: bool) -> R
                             Action::None => {}
                             Action::Quit => break,
                             Action::Send(request) => write_frame(&mut writer, &request).await?,
+                            Action::SendMany(requests) => for request in requests { write_frame(&mut writer, &request).await?; },
+                            Action::Osc52(sequence) => { use std::io::Write as _; std::io::stdout().write_all(sequence.as_bytes())?; std::io::stdout().flush()?; },
                         }
                     }
                     Event::Resize(columns, rows) => {
-                        if let Some(pane_id) = app.selected_running_pane_id() {
-                            write_frame(&mut writer, &Request::Resize {
-                                pane_id,
-                                rows: rows.saturating_sub(7),
-                                cols: columns.saturating_sub(30),
-                            }).await?;
-                        }
+                        let _ = (columns, rows); // renderer drives every pane's exact inner size
                     }
+                    Event::Paste(text) => if let Action::Send(request) = app.process_paste(text) { write_frame(&mut writer, &request).await?; },
+                    Event::Mouse(mouse) => if let Action::Send(request) = app.process_mouse(mouse) { write_frame(&mut writer, &request).await?; },
                     _ => {}
                 }
+                dirty = true;
             }
         }
     }
@@ -191,7 +240,13 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn restore(&mut self) -> Result<()> {
         disable_raw_mode().context("disable terminal raw mode")?;
-        execute!(std::io::stdout(), LeaveAlternateScreen).context("leave alternate screen")?;
+        execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        )
+        .context("leave alternate screen")?;
         Ok(())
     }
 }
@@ -199,6 +254,11 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
     }
 }

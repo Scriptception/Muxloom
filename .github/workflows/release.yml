@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+      - uses: taiki-e/install-action@f8d6f839d6544345199e12fd1e692165b256fdc1 # cross
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2
+        with:
+          tool: cargo-cyclonedx
+      - name: Build and package
+        env:
+          TARGET: ${{ matrix.target }}
+          NFPM_ARCH: ${{ matrix.arch }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          test "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')" = "$version"
+          cross build --release --locked --target "$TARGET"
+          cargo run --locked -- man > target/muxloom.1
+          cargo cyclonedx --format json
+          mkdir -p dist
+          install -m755 "target/$TARGET/release/muxloom" dist/muxloom
+          install -m644 target/muxloom.1 dist/muxloom.1
+          tar -C dist -czf "muxloom-$version-$TARGET.tar.gz" muxloom muxloom.1
+          curl -sSfL https://github.com/goreleaser/nfpm/releases/download/v2.43.4/nfpm_2.43.4_amd64.deb -o /tmp/nfpm.deb
+          sudo dpkg -i /tmp/nfpm.deb
+          MUXLOOM_VERSION="$version" MUXLOOM_BINARY="target/$TARGET/release/muxloom" nfpm package --config packaging/nfpm.yaml --packager deb --target "muxloom_${version}_${NFPM_ARCH}.deb"
+          MUXLOOM_VERSION="$version" MUXLOOM_BINARY="target/$TARGET/release/muxloom" nfpm package --config packaging/nfpm.yaml --packager rpm --target "muxloom-${version}.${NFPM_ARCH}.rpm"
+          cp muxloom.cdx.json "muxloom-$version-$TARGET.cdx.json"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: artifacts-${{ matrix.arch }}
+          path: |
+            muxloom-*.tar.gz
+            muxloom_*.deb
+            muxloom-*.rpm
+            muxloom-*.cdx.json
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: artifacts-*
+          merge-multiple: true
+      - name: Checksums
+        run: sha256sum muxloom-* > SHA256SUMS
+      - uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+      - name: Keyless signatures
+        run: |
+          for artifact in muxloom-* SHA256SUMS; do cosign sign-blob --yes --bundle "$artifact.sigstore.json" "$artifact"; done
+      - uses: actions/attest-build-provenance@78e6cbd37d0ac1a40113c04f2037dacf1ea3f12e # v4
+        with:
+          subject-path: 'muxloom-*'
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            muxloom-*
+            SHA256SUMS*

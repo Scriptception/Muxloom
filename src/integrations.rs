@@ -88,6 +88,7 @@ pub fn config_sources(muxloom: PathBuf) -> Vec<ConfigSource> {
     .collect()
 }
 
+#[allow(dead_code)]
 pub fn hermes_snapshot() -> HermesSnapshot {
     let available = std::env::var_os("PATH").is_some_and(|directories| {
         std::env::split_paths(&directories).any(|directory| directory.join("hermes").is_file())

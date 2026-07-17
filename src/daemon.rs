@@ -9,12 +9,12 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rusqlite::{Connection, params};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::{Mutex, broadcast, mpsc},
+    sync::{Mutex, broadcast, mpsc, watch},
 };
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -22,11 +22,14 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     model::{
-        AgentState, AttentionEvent, EventConfidence, PaneSummary, ScheduleRecord, UsageSnapshot,
-        WorkspaceSummary,
+        AgentState, AttentionEvent, EventConfidence, LayoutNode, PaneSummary, ScheduleRecord,
+        SplitAxis, UsageSnapshot, WorkspaceSummary,
     },
     paths::AppPaths,
-    protocol::{PROTOCOL_VERSION, Request, Response, read_frame, write_frame},
+    protocol::{
+        MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, REPLAY_CHUNK_BYTES, Request, Response,
+        negotiate_protocol, read_frame, write_frame,
+    },
 };
 
 const OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
@@ -36,6 +39,9 @@ struct PaneRuntime {
     master: Box<dyn MasterPty + Send>,
     writer: Arc<StdMutex<Box<dyn Write + Send>>>,
     output: VecDeque<u8>,
+    sequence: u64,
+    killer: Box<dyn ChildKiller + Send + Sync>,
+    inference_tail: VecDeque<u8>,
 }
 
 struct ServerState {
@@ -49,16 +55,29 @@ struct ServerState {
 }
 
 enum RuntimeEvent {
-    Output { pane_id: String, data: Vec<u8> },
-    Exited { pane_id: String },
+    Output {
+        pane_id: String,
+        data: Vec<u8>,
+    },
+    Exited {
+        pane_id: String,
+        exit_status: Option<i32>,
+    },
 }
 
 pub async fn run(paths: AppPaths) -> Result<()> {
     paths.ensure()?;
     let config = Config::load_or_create(&paths)?;
     initialize_database(&paths.database())?;
+    if let Some(hours) = config.lifecycle.prune_exited_after_hours {
+        prune_exited_before(
+            &paths.database(),
+            Utc::now() - chrono::Duration::hours(hours.min(i64::MAX as u64) as i64),
+        )?;
+    }
     let restored = restore_metadata(&paths.database())?;
     let schedules = restore_schedules(&paths.database())?;
+    let attention = restore_attention(&paths.database())?;
 
     if paths.socket().exists() {
         if UnixStream::connect(paths.socket()).await.is_ok() {
@@ -75,7 +94,7 @@ pub async fn run(paths: AppPaths) -> Result<()> {
             .map(|workspace| (workspace.id.clone(), workspace))
             .collect(),
         panes: HashMap::new(),
-        attention: Vec::new(),
+        attention,
         schedules,
         usage: Vec::new(),
         database: paths.database(),
@@ -83,6 +102,45 @@ pub async fn run(paths: AppPaths) -> Result<()> {
     }));
     let (updates, _) = broadcast::channel::<Response>(512);
     let (runtime_tx, mut runtime_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+    let respawns = {
+        let guard = state.lock().await;
+        guard
+            .workspaces
+            .values()
+            .filter(|workspace| workspace.respawn)
+            .filter_map(|workspace| {
+                workspace.panes.last().map(|pane| {
+                    (
+                        workspace.id.clone(),
+                        pane.title.clone(),
+                        pane.cwd.clone(),
+                        pane.command.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    for (workspace_id, title, cwd, command) in respawns {
+        match spawn_pane(&workspace_id, Some(title), cwd, command, runtime_tx.clone()) {
+            Ok(pane) => {
+                let mut guard = state.lock().await;
+                let database = guard.database.clone();
+                if let Some(workspace) = guard.workspaces.get_mut(&workspace_id) {
+                    workspace.panes.push(pane.summary.clone());
+                    workspace.layout = Some(LayoutNode::Pane {
+                        pane_id: pane.summary.id.clone(),
+                    });
+                    let updated = workspace.clone();
+                    persist_workspace(&database, &updated)?;
+                    persist_pane(&database, &pane.summary)?;
+                    guard.panes.insert(pane.summary.id.clone(), pane);
+                }
+            }
+            Err(problem) => error!(%problem, %workspace_id, "failed to respawn workspace command"),
+        }
+    }
 
     let event_state = Arc::clone(&state);
     let event_updates = updates.clone();
@@ -106,20 +164,51 @@ pub async fn run(paths: AppPaths) -> Result<()> {
         monitor_usage(usage_state).await;
     });
 
+    #[cfg(unix)]
+    {
+        let signal_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            if let Ok(mut signal) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
+                signal.recv().await;
+                let _ = signal_shutdown.send(true);
+            }
+        });
+    }
+
     info!(socket = %paths.socket().display(), "Muxloom daemon ready");
     loop {
-        let (stream, _) = listener.accept().await.context("accept client")?;
+        let accepted = tokio::select! {
+            accepted = listener.accept() => Some(accepted.context("accept client")?),
+            changed = shutdown_rx.changed() => { changed.ok(); None },
+            signal = tokio::signal::ctrl_c() => { signal.context("listen for shutdown signal")?; None },
+        };
+        let Some((stream, _)) = accepted else {
+            break;
+        };
         let client_state = Arc::clone(&state);
         let client_updates = updates.clone();
         let client_runtime = runtime_tx.clone();
+        let client_shutdown = shutdown_tx.clone();
         tokio::spawn(async move {
-            if let Err(problem) =
-                handle_client(stream, client_state, client_updates, client_runtime).await
+            if let Err(problem) = handle_client(
+                stream,
+                client_state,
+                client_updates,
+                client_runtime,
+                client_shutdown,
+            )
+            .await
             {
                 debug!(%problem, "client disconnected");
             }
         });
     }
+    let terminated = graceful_shutdown(&state).await?;
+    let _ = std::fs::remove_file(paths.socket());
+    info!(terminated, "Muxloom daemon stopped cleanly");
+    Ok(())
 }
 
 async fn handle_client(
@@ -127,9 +216,48 @@ async fn handle_client(
     state: Arc<Mutex<ServerState>>,
     updates: broadcast::Sender<Response>,
     runtime_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    shutdown: watch::Sender<bool>,
 ) -> Result<()> {
     verify_peer(&stream)?;
     let (mut reader, mut writer) = stream.into_split();
+    let hello: Request = read_frame(&mut reader).await?;
+    let Request::Hello {
+        min_version,
+        max_version,
+        ..
+    } = hello
+    else {
+        write_frame(
+            &mut writer,
+            &Response::Error {
+                message: "protocol handshake required before any request".into(),
+            },
+        )
+        .await?;
+        return Ok(());
+    };
+    let negotiated = match negotiate_protocol(min_version, max_version) {
+        Ok(version) => version,
+        Err(problem) => {
+            write_frame(
+                &mut writer,
+                &Response::Error {
+                    message: problem.to_string(),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    write_frame(
+        &mut writer,
+        &Response::Hello {
+            protocol_version: negotiated,
+            min_version: MIN_PROTOCOL_VERSION,
+            server_version: env!("CARGO_PKG_VERSION").into(),
+        },
+    )
+    .await?;
     let first: Request = read_frame(&mut reader).await?;
 
     if let Request::Attach {
@@ -137,6 +265,7 @@ async fn handle_client(
         readonly,
     } = first
     {
+        let mut subscription = updates.subscribe();
         let (snapshot, buffered_output) = {
             let guard = state.lock().await;
             if !guard.workspaces.contains_key(&workspace_id) {
@@ -157,19 +286,16 @@ async fn handle_client(
                     (
                         pane.summary.id.clone(),
                         pane.output.iter().copied().collect(),
+                        pane.sequence,
                     )
                 })
-                .collect::<Vec<(String, Vec<u8>)>>();
+                .collect::<Vec<(String, Vec<u8>, u64)>>();
             (snapshot_locked(&guard), output)
         };
         write_frame(&mut writer, &snapshot).await?;
-        for (pane_id, data) in buffered_output {
-            if !data.is_empty() {
-                write_frame(&mut writer, &Response::Output { pane_id, data }).await?;
-            }
+        for (pane_id, data, sequence) in buffered_output {
+            write_replay(&mut writer, pane_id, data, sequence).await?;
         }
-
-        let mut subscription = updates.subscribe();
         loop {
             tokio::select! {
                 incoming = read_frame::<_, Request>(&mut reader) => {
@@ -179,8 +305,8 @@ async fn handle_client(
                             let guard = state.lock().await;
                             guard.workspaces.contains_key(&requested).then(|| guard.panes.values()
                                 .filter(|pane| pane.summary.workspace_id == requested)
-                                .map(|pane| (pane.summary.id.clone(), pane.output.iter().copied().collect()))
-                                .collect::<Vec<(String, Vec<u8>)>>())
+                                .map(|pane| (pane.summary.id.clone(), pane.output.iter().copied().collect(), pane.sequence))
+                                .collect::<Vec<(String, Vec<u8>, u64)>>())
                         };
                         let Some(buffered_output) = buffered_output else {
                             write_frame(&mut writer, &Response::Error {
@@ -190,19 +316,21 @@ async fn handle_client(
                         };
                         workspace_id = requested;
                         write_frame(&mut writer, &Response::Ok).await?;
-                        for (pane_id, data) in buffered_output {
-                            if !data.is_empty() {
-                                write_frame(&mut writer, &Response::Output { pane_id, data }).await?;
-                            }
+                        for (pane_id, data, sequence) in buffered_output {
+                            write_replay(&mut writer, pane_id, data, sequence).await?;
                         }
                         continue;
                     }
-                    if readonly && matches!(request, Request::Input { .. } | Request::CreatePane { .. } | Request::ClosePane { .. }) {
+                    if readonly && !readonly_request_allowed(&request) {
                         write_frame(&mut writer, &Response::Error { message: "client is attached read-only".into() }).await?;
                         continue;
                     }
+                    let shutting_down = matches!(request, Request::Shutdown);
                     match dispatch(request, &state, &updates, &runtime_tx).await {
-                        Ok(Some(response)) => write_frame(&mut writer, &response).await?,
+                        Ok(Some(response)) => {
+                            write_frame(&mut writer, &response).await?;
+                            if shutting_down { let _ = shutdown.send(true); return Ok(()); }
+                        }
                         Ok(None) => {}
                         Err(problem) => {
                             write_frame(&mut writer, &Response::Error {
@@ -216,7 +344,17 @@ async fn handle_client(
                         Ok(response) if response_matches_workspace(&response, &workspace_id, &state).await => {
                             write_frame(&mut writer, &response).await?;
                         }
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                            warn!(dropped, "client lagged; resynchronizing terminal snapshots");
+                            let snapshots = {
+                                let guard = state.lock().await;
+                                guard.panes.values().filter(|pane| pane.summary.workspace_id == workspace_id)
+                                    .map(|pane| (pane.summary.id.clone(), pane.output.iter().copied().collect(), pane.sequence))
+                                    .collect::<Vec<(String, Vec<u8>, u64)>>()
+                            };
+                            for (pane_id, data, sequence) in snapshots { write_replay(&mut writer, pane_id, data, sequence).await?; }
+                        }
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     }
                 }
@@ -224,8 +362,14 @@ async fn handle_client(
         }
     }
 
+    let shutting_down = matches!(first, Request::Shutdown);
     match dispatch(first, &state, &updates, &runtime_tx).await {
-        Ok(Some(response)) => write_frame(&mut writer, &response).await?,
+        Ok(Some(response)) => {
+            write_frame(&mut writer, &response).await?;
+            if shutting_down {
+                let _ = shutdown.send(true);
+            }
+        }
         Ok(None) => {}
         Err(problem) => {
             write_frame(
@@ -238,6 +382,81 @@ async fn handle_client(
         }
     }
     Ok(())
+}
+
+fn readonly_request_allowed(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::List | Request::Capture { .. } | Request::ListAttention | Request::ListSchedules
+    )
+}
+
+async fn write_replay<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    pane_id: String,
+    data: Vec<u8>,
+    sequence: u64,
+) -> Result<()> {
+    if data.is_empty() {
+        return write_frame(
+            writer,
+            &Response::PaneSnapshot {
+                pane_id,
+                data,
+                sequence,
+                reset: true,
+            },
+        )
+        .await;
+    }
+    for (index, chunk) in data.chunks(REPLAY_CHUNK_BYTES).enumerate() {
+        write_frame(
+            writer,
+            &Response::PaneSnapshot {
+                pane_id: pane_id.clone(),
+                data: chunk.to_vec(),
+                sequence,
+                reset: index == 0,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn graceful_shutdown(state: &Arc<Mutex<ServerState>>) -> Result<usize> {
+    let pids = {
+        let guard = state.lock().await;
+        guard
+            .panes
+            .values()
+            .filter_map(|pane| pane.summary.pid)
+            .collect::<Vec<_>>()
+    };
+    for pid in &pids {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(*pid as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let mut guard = state.lock().await;
+    let database = guard.database.clone();
+    let now = Utc::now();
+    for pane in guard.panes.values_mut() {
+        if pane.summary.exited_at.is_none() {
+            let _ = pane.killer.kill();
+            pane.summary.state = AgentState::Exited;
+            pane.summary.exited_at = Some(now);
+            pane.summary.unread = false;
+            mark_pane_exited(&database, &pane.summary.id, pane.summary.exit_status)?;
+        }
+    }
+    let workspace_ids = guard.workspaces.keys().cloned().collect::<Vec<_>>();
+    for workspace_id in workspace_ids {
+        sync_workspace_panes(&mut guard, &workspace_id);
+    }
+    Ok(pids.len())
 }
 
 async fn dispatch(
@@ -261,8 +480,14 @@ async fn dispatch(
                 }
             }
         }
-        Request::CreateWorkspace { name, cwd, command } => {
-            let workspace = create_workspace(state, runtime_tx, name, cwd, command).await?;
+        Request::CreateWorkspace {
+            name,
+            cwd,
+            command,
+            respawn,
+        } => {
+            let workspace =
+                create_workspace(state, runtime_tx, name, cwd, command, None, respawn).await?;
             Response::WorkspaceCreated { workspace }
         }
         Request::CreatePane {
@@ -270,6 +495,8 @@ async fn dispatch(
             cwd,
             command,
             title,
+            split_from,
+            split_axis,
         } => {
             let pane = spawn_pane(&workspace_id, title, cwd, command, runtime_tx.clone())?;
             let mut guard = state.lock().await;
@@ -279,7 +506,19 @@ async fn dispatch(
                 .get_mut(&workspace_id)
                 .ok_or_else(|| anyhow!("workspace {workspace_id} does not exist"))?;
             workspace.panes.push(pane.summary.clone());
+            workspace.layout = Some(match workspace.layout.take() {
+                Some(layout) => split_layout(
+                    layout,
+                    split_from.as_deref(),
+                    pane.summary.id.clone(),
+                    split_axis.unwrap_or(SplitAxis::Vertical),
+                ),
+                None => LayoutNode::Pane {
+                    pane_id: pane.summary.id.clone(),
+                },
+            });
             let updated = workspace.clone();
+            persist_workspace(&database, &updated)?;
             persist_pane(&database, &pane.summary)?;
             guard.panes.insert(pane.summary.id.clone(), pane);
             let response = Response::PaneUpdated { workspace: updated };
@@ -346,24 +585,115 @@ async fn dispatch(
                 .get(&pane_id)
                 .map(|pane| pane.summary.workspace_id.clone())
                 .ok_or_else(|| anyhow!("pane {pane_id} is not running"))?;
-            let pane = guard
+            let mut pane = guard
                 .panes
                 .remove(&pane_id)
                 .ok_or_else(|| anyhow!("pane {pane_id} is not running"))?;
-            drop(pane);
+            let _ = pane.killer.kill();
             let database = guard.database.clone();
             let workspace = guard.workspaces.get_mut(&workspace_id);
             if let Some(workspace) = workspace {
                 workspace.panes.retain(|item| item.id != pane_id);
+                workspace.layout = workspace
+                    .layout
+                    .take()
+                    .and_then(|layout| remove_from_layout(layout, &pane_id));
                 let updated = workspace.clone();
-                mark_pane_exited(&database, &pane_id)?;
+                persist_workspace(&database, &updated)?;
+                mark_pane_exited(&database, &pane_id, None)?;
                 let response = Response::PaneUpdated { workspace: updated };
                 let _ = updates.send(response.clone());
                 response
             } else {
-                mark_pane_exited(&database, &pane_id)?;
+                mark_pane_exited(&database, &pane_id, None)?;
                 Response::Ok
             }
+        }
+        Request::RenameWorkspace { workspace_id, name } => {
+            if name.trim().is_empty() {
+                bail!("workspace name cannot be empty");
+            }
+            let mut guard = state.lock().await;
+            let database = guard.database.clone();
+            let workspace = guard
+                .workspaces
+                .get_mut(&workspace_id)
+                .ok_or_else(|| anyhow!("workspace {workspace_id} does not exist"))?;
+            workspace.name = name.trim().into();
+            let updated = workspace.clone();
+            persist_workspace(&database, &updated)?;
+            let response = Response::PaneUpdated { workspace: updated };
+            let _ = updates.send(response.clone());
+            response
+        }
+        Request::DeleteWorkspace { workspace_id } => {
+            let mut guard = state.lock().await;
+            let workspace = guard
+                .workspaces
+                .remove(&workspace_id)
+                .ok_or_else(|| anyhow!("workspace {workspace_id} does not exist"))?;
+            for pane in &workspace.panes {
+                if let Some(mut runtime) = guard.panes.remove(&pane.id) {
+                    let _ = runtime.killer.kill();
+                }
+            }
+            delete_workspace(&guard.database, &workspace_id)?;
+            let response = Response::StateSnapshot {
+                workspaces: guard.workspaces.values().cloned().collect(),
+                attention: guard.attention.clone(),
+                usage: guard.usage.clone(),
+            };
+            let _ = updates.send(response.clone());
+            response
+        }
+        Request::PruneExited { workspace_id } => {
+            let mut guard = state.lock().await;
+            for workspace in guard
+                .workspaces
+                .values_mut()
+                .filter(|workspace| workspace_id.as_ref().is_none_or(|id| &workspace.id == id))
+            {
+                let removed = workspace
+                    .panes
+                    .iter()
+                    .filter(|pane| pane.exited_at.is_some())
+                    .map(|pane| pane.id.clone())
+                    .collect::<Vec<_>>();
+                workspace.panes.retain(|pane| pane.exited_at.is_none());
+                for pane_id in removed {
+                    workspace.layout = workspace
+                        .layout
+                        .take()
+                        .and_then(|layout| remove_from_layout(layout, &pane_id));
+                }
+            }
+            prune_exited(&guard.database, workspace_id.as_deref())?;
+            Response::Ok
+        }
+        Request::SetLayout {
+            workspace_id,
+            layout,
+        } => {
+            let mut ids = Vec::new();
+            layout.pane_ids(&mut ids);
+            let mut guard = state.lock().await;
+            let database = guard.database.clone();
+            let workspace = guard
+                .workspaces
+                .get_mut(&workspace_id)
+                .ok_or_else(|| anyhow!("workspace {workspace_id} does not exist"))?;
+            if ids
+                .iter()
+                .any(|id| !workspace.panes.iter().any(|pane| &pane.id == id))
+            {
+                bail!("layout references an unknown pane");
+            }
+            workspace.layout = Some(layout);
+            let updated = workspace.clone();
+            persist_workspace(&database, &updated)?;
+            let response = Response::PaneUpdated { workspace: updated };
+            let _ = updates.send(response.clone());
+            response
         }
         Request::AgentEvent {
             pane_id,
@@ -376,7 +706,13 @@ async fn dispatch(
             apply_agent_event(
                 &mut guard, &pane_id, &provider, next_state, &summary, confidence,
             )?;
-            let event = guard.attention.last().cloned();
+            persist_attention(&guard.database, &guard.attention)?;
+            let event = guard
+                .attention
+                .iter()
+                .rev()
+                .find(|event| event.pane_id == pane_id && event.read_at.is_none())
+                .cloned();
             drop(guard);
             if let Some(event) =
                 event.filter(|event| event.pane_id == pane_id && event.read_at.is_none())
@@ -398,6 +734,24 @@ async fn dispatch(
             if let Some(event) = guard.attention.iter_mut().find(|event| event.id == id) {
                 event.read_at = Some(Utc::now());
             }
+            persist_attention(&guard.database, &guard.attention)?;
+            Response::Ok
+        }
+        Request::MarkAllAttentionRead => {
+            let mut guard = state.lock().await;
+            let now = Utc::now();
+            for event in &mut guard.attention {
+                if event.read_at.is_none() {
+                    event.read_at = Some(now);
+                }
+            }
+            persist_attention(&guard.database, &guard.attention)?;
+            Response::Ok
+        }
+        Request::DismissAttention { id } => {
+            let mut guard = state.lock().await;
+            guard.attention.retain(|event| event.id != id);
+            persist_attention(&guard.database, &guard.attention)?;
             Response::Ok
         }
         Request::ListSchedules => {
@@ -424,6 +778,12 @@ async fn dispatch(
         Request::RunSchedule { id } => {
             let schedule = {
                 let guard = state.lock().await;
+                if guard.workspaces.values().any(|workspace| {
+                    workspace.schedule_id.as_deref() == Some(&id)
+                        && workspace.panes.iter().any(|pane| pane.exited_at.is_none())
+                }) {
+                    bail!("schedule {id} already has a running workspace");
+                }
                 guard
                     .schedules
                     .iter()
@@ -431,15 +791,27 @@ async fn dispatch(
                     .cloned()
                     .ok_or_else(|| anyhow!("schedule {id} does not exist"))?
             };
+            cleanup_schedule_workspaces(state, &schedule.id).await?;
             let name = format!("schedule-{}", schedule.name);
-            let workspace =
-                create_workspace(state, runtime_tx, name, schedule.cwd, schedule.command).await?;
+            let workspace = create_workspace(
+                state,
+                runtime_tx,
+                name,
+                schedule.cwd,
+                schedule.command,
+                Some(schedule.id),
+                false,
+            )
+            .await?;
             Response::WorkspaceCreated { workspace }
         }
         Request::Shutdown => {
             warn!("shutdown requested");
-            std::process::exit(0);
+            Response::ShutdownComplete {
+                terminated_panes: state.lock().await.panes.len(),
+            }
         }
+        Request::Hello { .. } => bail!("handshake is already complete"),
         Request::Attach { .. } => bail!("attach must be the first request on a connection"),
         Request::SwitchWorkspace { .. } => {
             bail!("workspace switching requires an attached connection")
@@ -454,19 +826,42 @@ async fn create_workspace(
     name: String,
     cwd: String,
     command: Vec<String>,
+    schedule_id: Option<String>,
+    respawn: bool,
 ) -> Result<WorkspaceSummary> {
     let workspace_id = Uuid::new_v4().to_string();
     let mut workspace = WorkspaceSummary {
         id: workspace_id.clone(),
-        name: unique_workspace_name(state, &name).await,
+        name: String::new(),
         created_at: Utc::now(),
         panes: Vec::new(),
+        layout: None,
+        respawn,
+        schedule_id,
     };
-    let pane = spawn_pane(&workspace_id, None, cwd, command, runtime_tx.clone())?;
+    {
+        let mut guard = state.lock().await;
+        workspace.name = unique_workspace_name_locked(&guard, &name);
+        guard
+            .workspaces
+            .insert(workspace_id.clone(), workspace.clone());
+        persist_workspace(&guard.database, &workspace)?;
+    }
+    let pane = match spawn_pane(&workspace_id, None, cwd, command, runtime_tx.clone()) {
+        Ok(pane) => pane,
+        Err(problem) => {
+            let mut guard = state.lock().await;
+            guard.workspaces.remove(&workspace_id);
+            let _ = delete_workspace(&guard.database, &workspace_id);
+            return Err(problem);
+        }
+    };
     workspace.panes.push(pane.summary.clone());
+    workspace.layout = Some(LayoutNode::Pane {
+        pane_id: pane.summary.id.clone(),
+    });
     let mut guard = state.lock().await;
-    persist_workspace(&guard.database, &workspace)?;
-    persist_pane(&guard.database, &pane.summary)?;
+    persist_workspace_with_pane(&guard.database, &workspace, &pane.summary)?;
     guard.panes.insert(pane.summary.id.clone(), pane);
     guard.workspaces.insert(workspace_id, workspace.clone());
     Ok(workspace)
@@ -506,11 +901,12 @@ fn spawn_pane(
     builder.env("MUXLOOM_PANE_ID", &pane_id);
     builder.env("MUXLOOM_WORKSPACE_ID", workspace_id);
     builder.env("MUXLOOM_PROVIDER", &provider);
-    let child = pair
+    let mut child = pair
         .slave
         .spawn_command(builder)
         .context("spawn pane command")?;
     let pid = child.process_id();
+    let killer = child.clone_killer();
     drop(pair.slave);
 
     let mut reader = pair.master.try_clone_reader().context("clone PTY reader")?;
@@ -539,10 +935,11 @@ fn spawn_pane(
                     Err(_) => break,
                 }
             }
+            let exit_status = child.wait().ok().map(|status| status.exit_code() as i32);
             let _ = runtime_tx.send(RuntimeEvent::Exited {
                 pane_id: output_pane_id,
+                exit_status,
             });
-            drop(child);
         })
         .context("start PTY reader")?;
 
@@ -565,6 +962,8 @@ fn spawn_pane(
         progress: None,
         started_at: Utc::now(),
         exited_at: None,
+        exit_status: None,
+        daemon_lost: false,
         unread: false,
     };
     Ok(PaneRuntime {
@@ -572,6 +971,9 @@ fn spawn_pane(
         master: pair.master,
         writer,
         output: VecDeque::new(),
+        sequence: 0,
+        killer,
+        inference_tail: VecDeque::new(),
     })
 }
 
@@ -589,17 +991,26 @@ async fn process_runtime_event(
                 .lines
                 .saturating_mul(240)
                 .max(64 * 1024);
-            let inferred = infer_state(&data);
+            let mut inferred = None;
             let mut state_changed = false;
             let mut workspace_id = None;
             if let Some(pane) = guard.panes.get_mut(&pane_id) {
                 workspace_id = Some(pane.summary.workspace_id.clone());
                 pane.output.extend(&data);
-                let limit = scrollback_limit.min(OUTPUT_BUFFER_BYTES.max(scrollback_limit));
+                let limit = scrollback_limit.min(OUTPUT_BUFFER_BYTES);
                 while pane.output.len() > limit {
-                    pane.output.pop_front();
+                    while pane.output.pop_front().is_some_and(|byte| byte != b'\n') {}
                 }
-                if pane.summary.state == AgentState::Starting {
+                pane.inference_tail.extend(&data);
+                while pane.inference_tail.len() > 4096 {
+                    pane.inference_tail.pop_front();
+                }
+                inferred = infer_state(&pane.inference_tail.iter().copied().collect::<Vec<_>>());
+                if matches!(
+                    pane.summary.state,
+                    AgentState::Starting | AgentState::Error | AgentState::WaitingInput
+                ) && inferred.is_none()
+                {
                     pane.summary.state = AgentState::Working;
                     state_changed = true;
                 }
@@ -620,16 +1031,33 @@ async fn process_runtime_event(
                 )?;
                 state_changed = true;
             }
+            let output_workspace_id = workspace_id.clone().unwrap_or_default();
             if state_changed && let Some(workspace_id) = workspace_id {
                 sync_workspace_panes(&mut guard, &workspace_id);
                 if let Some(workspace) = guard.workspaces.get(&workspace_id).cloned() {
                     let _ = updates.send(Response::PaneUpdated { workspace });
                 }
             }
+            if state_changed {
+                persist_attention(&guard.database, &guard.attention)?;
+            }
+            let sequence = guard.panes.get_mut(&pane_id).map_or(0, |pane| {
+                let sequence = pane.sequence;
+                pane.sequence = pane.sequence.saturating_add(1);
+                sequence
+            });
             drop(guard);
-            let _ = updates.send(Response::Output { pane_id, data });
+            let _ = updates.send(Response::Output {
+                workspace_id: output_workspace_id,
+                pane_id,
+                data,
+                sequence,
+            });
         }
-        RuntimeEvent::Exited { pane_id } => {
+        RuntimeEvent::Exited {
+            pane_id,
+            exit_status,
+        } => {
             let mut guard = state.lock().await;
             let database = guard.database.clone();
             let mut workspace_id = None;
@@ -638,6 +1066,7 @@ async fn process_runtime_event(
                 workspace_id = Some(pane.summary.workspace_id.clone());
                 pane.summary.state = AgentState::CompletedUnread;
                 pane.summary.exited_at = Some(Utc::now());
+                pane.summary.exit_status = exit_status;
                 pane.summary.unread = true;
                 attention_details =
                     Some((pane.summary.provider.clone(), pane.summary.title.clone()));
@@ -652,7 +1081,7 @@ async fn process_runtime_event(
                     EventConfidence::Native,
                 );
             }
-            mark_pane_exited(&database, &pane_id)?;
+            mark_pane_exited(&database, &pane_id, exit_status)?;
             if let Some(workspace_id) = workspace_id {
                 sync_workspace_panes(&mut guard, &workspace_id);
                 if let Some(workspace) = guard.workspaces.get(&workspace_id).cloned() {
@@ -662,6 +1091,7 @@ async fn process_runtime_event(
             if let Some(event) = guard.attention.last().cloned() {
                 let _ = updates.send(Response::Attention { event });
             }
+            persist_attention(&guard.database, &guard.attention)?;
         }
     }
     Ok(())
@@ -765,21 +1195,25 @@ async fn monitor_usage(state: Arc<Mutex<ServerState>>) {
             guard
                 .panes
                 .values()
+                .filter(|pane| pane.summary.exited_at.is_none())
                 .map(|pane| pane.summary.clone())
                 .collect::<Vec<_>>()
         };
+        let mut worker_system = std::mem::replace(&mut system, System::new());
         let refreshed = tokio::task::spawn_blocking(move || {
             let process_ids = panes
                 .iter()
                 .filter_map(|pane| pane.pid.map(Pid::from_u32))
                 .collect::<Vec<_>>();
             if !process_ids.is_empty() {
-                system.refresh_processes(ProcessesToUpdate::Some(&process_ids), true);
+                worker_system.refresh_processes(ProcessesToUpdate::Some(&process_ids), true);
             }
             let usage = panes
                 .into_iter()
                 .map(|pane| {
-                    let process = pane.pid.and_then(|pid| system.process(Pid::from_u32(pid)));
+                    let process = pane
+                        .pid
+                        .and_then(|pid| worker_system.process(Pid::from_u32(pid)));
                     UsageSnapshot {
                         pane_id: pane.id,
                         cpu_percent: process.map_or(0.0, sysinfo::Process::cpu_usage),
@@ -791,12 +1225,13 @@ async fn monitor_usage(state: Arc<Mutex<ServerState>>) {
                     }
                 })
                 .collect();
-            (system, usage)
+            (worker_system, usage)
         })
         .await;
         let Ok((next_system, usage)) = refreshed else {
             warn!("usage monitor worker failed");
-            return;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            continue;
         };
         system = next_system;
         state.lock().await.usage = usage;
@@ -809,7 +1244,11 @@ async fn response_matches_workspace(
     state: &Arc<Mutex<ServerState>>,
 ) -> bool {
     match response {
-        Response::Output { pane_id, .. } | Response::Capture { pane_id, .. } => state
+        Response::Output {
+            workspace_id: output_workspace,
+            ..
+        } => output_workspace == workspace_id,
+        Response::Capture { pane_id, .. } => state
             .lock()
             .await
             .panes
@@ -826,14 +1265,13 @@ async fn response_matches_workspace(
     }
 }
 
-async fn unique_workspace_name(state: &Arc<Mutex<ServerState>>, requested: &str) -> String {
+fn unique_workspace_name_locked(state: &ServerState, requested: &str) -> String {
     let base = if requested.trim().is_empty() {
         "workspace"
     } else {
         requested.trim()
     };
-    let guard = state.lock().await;
-    if !guard
+    if !state
         .workspaces
         .values()
         .any(|workspace| workspace.name == base)
@@ -842,7 +1280,7 @@ async fn unique_workspace_name(state: &Arc<Mutex<ServerState>>, requested: &str)
     }
     for number in 2..10_000 {
         let candidate = format!("{base}-{number}");
-        if !guard
+        if !state
             .workspaces
             .values()
             .any(|workspace| workspace.name == candidate)
@@ -851,6 +1289,85 @@ async fn unique_workspace_name(state: &Arc<Mutex<ServerState>>, requested: &str)
         }
     }
     format!("{base}-{}", Uuid::new_v4().simple())
+}
+
+fn split_layout(
+    layout: LayoutNode,
+    target: Option<&str>,
+    pane_id: String,
+    axis: SplitAxis,
+) -> LayoutNode {
+    match layout {
+        LayoutNode::Pane { pane_id: existing }
+            if target.is_none_or(|target| target == existing) =>
+        {
+            LayoutNode::Split {
+                axis,
+                ratio: 50,
+                first: Box::new(LayoutNode::Pane { pane_id: existing }),
+                second: Box::new(LayoutNode::Pane { pane_id }),
+            }
+        }
+        LayoutNode::Split {
+            axis: current_axis,
+            ratio,
+            first,
+            second,
+        } => {
+            let first_contains = target.is_some_and(|target| {
+                let mut ids = Vec::new();
+                first.pane_ids(&mut ids);
+                ids.iter().any(|id| id == target)
+            });
+            if first_contains {
+                LayoutNode::Split {
+                    axis: current_axis,
+                    ratio,
+                    first: Box::new(split_layout(*first, target, pane_id, axis)),
+                    second,
+                }
+            } else {
+                LayoutNode::Split {
+                    axis: current_axis,
+                    ratio,
+                    first,
+                    second: Box::new(split_layout(*second, target, pane_id, axis)),
+                }
+            }
+        }
+        node => LayoutNode::Split {
+            axis,
+            ratio: 50,
+            first: Box::new(node),
+            second: Box::new(LayoutNode::Pane { pane_id }),
+        },
+    }
+}
+
+fn remove_from_layout(layout: LayoutNode, pane_id: &str) -> Option<LayoutNode> {
+    match layout {
+        LayoutNode::Pane { pane_id: current } => {
+            (current != pane_id).then_some(LayoutNode::Pane { pane_id: current })
+        }
+        LayoutNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => match (
+            remove_from_layout(*first, pane_id),
+            remove_from_layout(*second, pane_id),
+        ) {
+            (Some(first), Some(second)) => Some(LayoutNode::Split {
+                axis,
+                ratio,
+                first: Box::new(first),
+                second: Box::new(second),
+            }),
+            (Some(node), None) | (None, Some(node)) => Some(node),
+            (None, None) => None,
+        },
+    }
 }
 
 fn detect_provider(command: &str) -> String {
@@ -891,19 +1408,19 @@ fn infer_state(data: &[u8]) -> Option<(AgentState, String)> {
 
 fn tail_lines(output: &VecDeque<u8>, lines: usize) -> Vec<u8> {
     let bytes = output.iter().copied().collect::<Vec<_>>();
-    let mut starts = bytes
+    if lines == 0 {
+        return Vec::new();
+    }
+    let separators = bytes
         .iter()
         .enumerate()
-        .filter_map(|(index, byte)| (*byte == b'\n').then_some(index + 1))
+        .filter_map(|(index, byte)| (*byte == b'\n' && index + 1 < bytes.len()).then_some(index))
         .collect::<Vec<_>>();
-    starts.push(0);
-    starts.sort_unstable();
-    let start = starts
+    let start = separators
         .iter()
         .rev()
         .nth(lines.saturating_sub(1))
-        .copied()
-        .unwrap_or(0);
+        .map_or(0, |index| index + 1);
     bytes[start..].to_vec()
 }
 
@@ -956,7 +1473,7 @@ async fn run_scheduler(
         let now = Utc::now();
         let due = {
             let mut guard = state.lock().await;
-            let active_names = guard
+            let active_schedule_ids = guard
                 .workspaces
                 .values()
                 .filter(|workspace| {
@@ -964,7 +1481,7 @@ async fn run_scheduler(
                         !matches!(pane.state, AgentState::Exited | AgentState::CompletedUnread)
                     })
                 })
-                .map(|workspace| workspace.name.clone())
+                .filter_map(|workspace| workspace.schedule_id.clone())
                 .collect::<Vec<_>>();
             let database = guard.database.clone();
             let mut due = Vec::new();
@@ -972,7 +1489,6 @@ async fn run_scheduler(
                 if !schedule.enabled || schedule.next_run_at.is_none_or(|next| next > now) {
                     continue;
                 }
-                let workspace_name = format!("schedule-{}", schedule.name);
                 schedule.last_run_at = Some(now);
                 match calculate_next_run(schedule, now) {
                     Ok(next) => schedule.next_run_at = next,
@@ -984,19 +1500,26 @@ async fn run_scheduler(
                 if let Err(problem) = persist_schedule(&database, schedule) {
                     error!(%problem, schedule = %schedule.name, "failed to persist scheduler tick");
                 }
-                if !active_names.contains(&workspace_name) {
+                if !active_schedule_ids.contains(&schedule.id) {
                     due.push(schedule.clone());
                 }
             }
             due
         };
         for schedule in due {
+            if let Err(problem) = cleanup_schedule_workspaces(&state, &schedule.id).await {
+                error!(%problem, schedule = %schedule.name, "failed to clean previous schedule workspace");
+                continue;
+            }
+            let schedule_id = schedule.id.clone();
             match create_workspace(
                 &state,
                 &runtime_tx,
                 format!("schedule-{}", schedule.name),
                 schedule.cwd,
                 schedule.command,
+                Some(schedule_id),
+                false,
             )
             .await
             {
@@ -1009,15 +1532,39 @@ async fn run_scheduler(
     }
 }
 
+async fn cleanup_schedule_workspaces(
+    state: &Arc<Mutex<ServerState>>,
+    schedule_id: &str,
+) -> Result<()> {
+    let mut guard = state.lock().await;
+    let stale = guard
+        .workspaces
+        .values()
+        .filter(|workspace| {
+            workspace.schedule_id.as_deref() == Some(schedule_id)
+                && workspace.panes.iter().all(|pane| pane.exited_at.is_some())
+        })
+        .map(|workspace| workspace.id.clone())
+        .collect::<Vec<_>>();
+    for workspace_id in stale {
+        guard.workspaces.remove(&workspace_id);
+        delete_workspace(&guard.database, &workspace_id)?;
+    }
+    Ok(())
+}
+
 fn initialize_database(database: &Path) -> Result<()> {
-    let connection = Connection::open(database).context("open Muxloom state database")?;
+    let connection = open_database(database)?;
     connection.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA foreign_keys=ON;
          CREATE TABLE IF NOT EXISTS workspaces (
            id TEXT PRIMARY KEY,
            name TEXT NOT NULL,
-           created_at TEXT NOT NULL
+           created_at TEXT NOT NULL,
+           layout_json TEXT,
+           respawn INTEGER NOT NULL DEFAULT 0,
+           schedule_id TEXT
          );
          CREATE TABLE IF NOT EXISTS panes (
            id TEXT PRIMARY KEY,
@@ -1028,35 +1575,78 @@ fn initialize_database(database: &Path) -> Result<()> {
            provider TEXT NOT NULL,
            started_at TEXT NOT NULL,
            exited_at TEXT,
+           pid INTEGER,
+           exit_status INTEGER,
+           daemon_lost INTEGER NOT NULL DEFAULT 0,
            FOREIGN KEY(workspace_id) REFERENCES workspaces(id)
          );
          CREATE TABLE IF NOT EXISTS schedules (
            id TEXT PRIMARY KEY,
            record_json TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS attention (
+           id TEXT PRIMARY KEY,
+           record_json TEXT NOT NULL
          );",
     )?;
+    for (table, column, definition) in [
+        ("workspaces", "layout_json", "TEXT"),
+        ("workspaces", "respawn", "INTEGER NOT NULL DEFAULT 0"),
+        ("workspaces", "schedule_id", "TEXT"),
+        ("panes", "pid", "INTEGER"),
+        ("panes", "exit_status", "INTEGER"),
+        ("panes", "daemon_lost", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !database_column_exists(&connection, table, column)? {
+            connection.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+            ))?;
+        }
+    }
+    connection.pragma_update(None, "user_version", 2)?;
     Ok(())
 }
 
+fn open_database(database: &Path) -> Result<Connection> {
+    let connection = Connection::open(database).context("open Muxloom state database")?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
+    Ok(connection)
+}
+
+fn database_column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for existing in columns {
+        if existing? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn persist_workspace(database: &Path, workspace: &WorkspaceSummary) -> Result<()> {
-    let connection = Connection::open(database)?;
+    let connection = open_database(database)?;
     connection.execute(
-        "INSERT OR REPLACE INTO workspaces (id, name, created_at) VALUES (?1, ?2, ?3)",
+        "INSERT OR REPLACE INTO workspaces (id, name, created_at, layout_json, respawn, schedule_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             workspace.id,
             workspace.name,
-            workspace.created_at.to_rfc3339()
+            workspace.created_at.to_rfc3339(),
+            workspace.layout.as_ref().map(serde_json::to_string).transpose()?,
+            workspace.respawn,
+            workspace.schedule_id,
         ],
     )?;
     Ok(())
 }
 
 fn persist_pane(database: &Path, pane: &PaneSummary) -> Result<()> {
-    let connection = Connection::open(database)?;
+    let connection = open_database(database)?;
     connection.execute(
         "INSERT OR REPLACE INTO panes
-         (id, workspace_id, title, cwd, command_json, provider, started_at, exited_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (id, workspace_id, title, cwd, command_json, provider, started_at, exited_at, pid, exit_status, daemon_lost)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             pane.id,
             pane.workspace_id,
@@ -1066,42 +1656,72 @@ fn persist_pane(database: &Path, pane: &PaneSummary) -> Result<()> {
             pane.provider,
             pane.started_at.to_rfc3339(),
             pane.exited_at.map(|value| value.to_rfc3339()),
+            pane.pid,
+            pane.exit_status,
+            pane.daemon_lost,
         ],
     )?;
     Ok(())
 }
 
-fn mark_pane_exited(database: &Path, pane_id: &str) -> Result<()> {
-    let connection = Connection::open(database)?;
+fn persist_workspace_with_pane(
+    database: &Path,
+    workspace: &WorkspaceSummary,
+    pane: &PaneSummary,
+) -> Result<()> {
+    let mut connection = open_database(database)?;
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "INSERT OR REPLACE INTO workspaces (id, name, created_at, layout_json, respawn, schedule_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![workspace.id, workspace.name, workspace.created_at.to_rfc3339(), workspace.layout.as_ref().map(serde_json::to_string).transpose()?, workspace.respawn, workspace.schedule_id],
+    )?;
+    transaction.execute(
+        "INSERT OR REPLACE INTO panes (id, workspace_id, title, cwd, command_json, provider, started_at, exited_at, pid, exit_status, daemon_lost) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![pane.id, pane.workspace_id, pane.title, pane.cwd, serde_json::to_string(&pane.command)?, pane.provider, pane.started_at.to_rfc3339(), pane.exited_at.map(|value| value.to_rfc3339()), pane.pid, pane.exit_status, pane.daemon_lost],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn mark_pane_exited(database: &Path, pane_id: &str, exit_status: Option<i32>) -> Result<()> {
+    let connection = open_database(database)?;
     connection.execute(
-        "UPDATE panes SET exited_at = ?1 WHERE id = ?2",
-        params![Utc::now().to_rfc3339(), pane_id],
+        "UPDATE panes SET exited_at = ?1, exit_status = ?2, daemon_lost = 0 WHERE id = ?3",
+        params![Utc::now().to_rfc3339(), exit_status, pane_id],
     )?;
     Ok(())
 }
 
 fn restore_metadata(database: &Path) -> Result<Vec<WorkspaceSummary>> {
-    let connection = Connection::open(database)?;
-    let mut statement = connection.prepare("SELECT id, name, created_at FROM workspaces")?;
+    let connection = open_database(database)?;
+    let mut statement = connection.prepare(
+        "SELECT id, name, created_at, layout_json, respawn, schedule_id FROM workspaces",
+    )?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, bool>(4)?,
+            row.get::<_, Option<String>>(5)?,
         ))
     })?;
     let mut workspaces = Vec::new();
     for row in rows {
-        let (id, name, created_at) = row?;
+        let (id, name, created_at, layout_json, respawn, schedule_id) = row?;
         workspaces.push(WorkspaceSummary {
             id,
             name,
             created_at: chrono::DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
             panes: Vec::new(),
+            layout: layout_json.and_then(|json| serde_json::from_str(&json).ok()),
+            respawn,
+            schedule_id,
         });
     }
     let mut pane_statement = connection.prepare(
-        "SELECT id, workspace_id, title, cwd, command_json, provider, started_at, exited_at FROM panes",
+        "SELECT id, workspace_id, title, cwd, command_json, provider, started_at, exited_at, pid, exit_status, daemon_lost FROM panes",
     )?;
     let panes = pane_statement.query_map([], |row| {
         Ok((
@@ -1113,10 +1733,31 @@ fn restore_metadata(database: &Path) -> Result<Vec<WorkspaceSummary>> {
             row.get::<_, String>(5)?,
             row.get::<_, String>(6)?,
             row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<u32>>(8)?,
+            row.get::<_, Option<i32>>(9)?,
+            row.get::<_, bool>(10)?,
         ))
     })?;
     for pane in panes {
-        let (id, workspace_id, title, cwd, command_json, provider, started_at, exited_at) = pane?;
+        let (
+            id,
+            workspace_id,
+            title,
+            cwd,
+            command_json,
+            provider,
+            started_at,
+            exited_at,
+            pid,
+            exit_status,
+            persisted_lost,
+        ) = pane?;
+        let parsed_exit = exited_at
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+            .map(|value| value.with_timezone(&Utc));
+        let daemon_lost = persisted_lost || parsed_exit.is_none();
+        let started_at = chrono::DateTime::parse_from_rfc3339(&started_at)?.with_timezone(&Utc);
+        let verified_pid = pid.filter(|pid| process_matches_start(*pid, started_at));
         let summary = PaneSummary {
             id,
             workspace_id: workspace_id.clone(),
@@ -1124,14 +1765,17 @@ fn restore_metadata(database: &Path) -> Result<Vec<WorkspaceSummary>> {
             cwd,
             command: serde_json::from_str(&command_json).unwrap_or_default(),
             provider,
-            pid: None,
-            state: AgentState::Exited,
+            pid: verified_pid,
+            state: if parsed_exit.is_some() {
+                AgentState::Exited
+            } else {
+                AgentState::Unknown
+            },
             progress: None,
-            started_at: chrono::DateTime::parse_from_rfc3339(&started_at)?.with_timezone(&Utc),
-            exited_at: exited_at
-                .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
-                .map(|value| value.with_timezone(&Utc))
-                .or(Some(Utc::now())),
+            started_at,
+            exited_at: parsed_exit,
+            exit_status,
+            daemon_lost,
             unread: false,
         };
         if let Some(workspace) = workspaces
@@ -1144,8 +1788,16 @@ fn restore_metadata(database: &Path) -> Result<Vec<WorkspaceSummary>> {
     Ok(workspaces)
 }
 
+fn process_matches_start(pid: u32, started_at: chrono::DateTime<Utc>) -> bool {
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
+    system
+        .process(Pid::from_u32(pid))
+        .is_some_and(|process| (process.start_time() as i64 - started_at.timestamp()).abs() <= 5)
+}
+
 fn persist_schedule(database: &Path, schedule: &ScheduleRecord) -> Result<()> {
-    let connection = Connection::open(database)?;
+    let connection = open_database(database)?;
     connection.execute(
         "INSERT OR REPLACE INTO schedules (id, record_json) VALUES (?1, ?2)",
         params![schedule.id, serde_json::to_string(schedule)?],
@@ -1154,12 +1806,12 @@ fn persist_schedule(database: &Path, schedule: &ScheduleRecord) -> Result<()> {
 }
 
 fn delete_schedule(database: &Path, id: &str) -> Result<()> {
-    Connection::open(database)?.execute("DELETE FROM schedules WHERE id = ?1", params![id])?;
+    open_database(database)?.execute("DELETE FROM schedules WHERE id = ?1", params![id])?;
     Ok(())
 }
 
 fn restore_schedules(database: &Path) -> Result<Vec<ScheduleRecord>> {
-    let connection = Connection::open(database)?;
+    let connection = open_database(database)?;
     let mut statement = connection.prepare("SELECT record_json FROM schedules")?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     let mut schedules = Vec::new();
@@ -1170,6 +1822,76 @@ fn restore_schedules(database: &Path) -> Result<Vec<ScheduleRecord>> {
         }
     }
     Ok(schedules)
+}
+
+fn delete_workspace(database: &Path, workspace_id: &str) -> Result<()> {
+    let mut connection = open_database(database)?;
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "DELETE FROM panes WHERE workspace_id = ?1",
+        params![workspace_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM workspaces WHERE id = ?1",
+        params![workspace_id],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn prune_exited(database: &Path, workspace_id: Option<&str>) -> Result<()> {
+    let connection = open_database(database)?;
+    if let Some(workspace_id) = workspace_id {
+        connection.execute(
+            "DELETE FROM panes WHERE exited_at IS NOT NULL AND workspace_id = ?1",
+            params![workspace_id],
+        )?;
+    } else {
+        connection.execute("DELETE FROM panes WHERE exited_at IS NOT NULL", [])?;
+    }
+    Ok(())
+}
+
+fn prune_exited_before(database: &Path, cutoff: chrono::DateTime<Utc>) -> Result<()> {
+    open_database(database)?.execute(
+        "DELETE FROM panes WHERE exited_at IS NOT NULL AND exited_at < ?1",
+        params![cutoff.to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn persist_attention(database: &Path, attention: &[AttentionEvent]) -> Result<()> {
+    let mut connection = open_database(database)?;
+    let transaction = connection.transaction()?;
+    transaction.execute("DELETE FROM attention", [])?;
+    let cutoff = Utc::now() - chrono::Duration::days(30);
+    for event in attention
+        .iter()
+        .rev()
+        .filter(|event| event.read_at.is_none_or(|read_at| read_at >= cutoff))
+        .take(2_000)
+    {
+        transaction.execute(
+            "INSERT INTO attention (id, record_json) VALUES (?1, ?2)",
+            params![event.id, serde_json::to_string(event)?],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn restore_attention(database: &Path) -> Result<Vec<AttentionEvent>> {
+    let connection = open_database(database)?;
+    let mut statement = connection.prepare("SELECT record_json FROM attention")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut events = Vec::new();
+    for row in rows {
+        if let Ok(event) = serde_json::from_str(&row?) {
+            events.push(event);
+        }
+    }
+    events.sort_by_key(|event: &AttentionEvent| event.created_at);
+    Ok(events)
 }
 
 #[cfg(unix)]
@@ -1183,26 +1905,11 @@ fn set_socket_permissions(socket: &Path) -> Result<()> {
 fn verify_peer(stream: &UnixStream) -> Result<()> {
     let credentials = stream.peer_cred().context("read peer credentials")?;
     let peer_uid = credentials.uid();
-    let own_uid = unsafe_uid();
+    let own_uid = nix::unistd::geteuid().as_raw();
     if peer_uid != own_uid {
         bail!("refusing connection from uid {peer_uid}");
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn unsafe_uid() -> u32 {
-    // std does not yet expose the effective uid. Reading /proc avoids unsafe libc calls.
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|contents| {
-            contents
-                .lines()
-                .find(|line| line.starts_with("Uid:"))
-                .and_then(|line| line.split_whitespace().nth(1))
-                .and_then(|value| value.parse().ok())
-        })
-        .unwrap_or(u32::MAX)
 }
 
 #[cfg(not(unix))]
@@ -1259,7 +1966,7 @@ mod tests {
     #[test]
     fn tail_capture_is_bounded_by_lines() {
         let output = VecDeque::from(b"one\ntwo\nthree\n".to_vec());
-        assert_eq!(tail_lines(&output, 2), b"three\n");
+        assert_eq!(tail_lines(&output, 2), b"two\nthree\n");
     }
 
     #[test]
@@ -1277,5 +1984,37 @@ mod tests {
         };
         assert!(validate_schedule(&schedule).is_ok());
         assert!(calculate_next_run(&schedule, Utc::now()).unwrap().is_some());
+    }
+
+    #[test]
+    fn readonly_policy_is_deny_by_default() {
+        assert!(readonly_request_allowed(&Request::List));
+        assert!(!readonly_request_allowed(&Request::Shutdown));
+        assert!(!readonly_request_allowed(&Request::MarkAllAttentionRead));
+        assert!(!readonly_request_allowed(&Request::CreateWorkspace {
+            name: "x".into(),
+            cwd: "/tmp".into(),
+            command: vec!["true".into()],
+            respawn: false
+        }));
+    }
+
+    #[test]
+    fn legacy_database_is_migrated_in_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("state.db");
+        let connection = Connection::open(&database).unwrap();
+        connection.execute_batch("CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE panes (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, title TEXT NOT NULL, cwd TEXT NOT NULL, command_json TEXT NOT NULL, provider TEXT NOT NULL, started_at TEXT NOT NULL, exited_at TEXT); CREATE TABLE schedules (id TEXT PRIMARY KEY, record_json TEXT NOT NULL);").unwrap();
+        drop(connection);
+        initialize_database(&database).unwrap();
+        let connection = open_database(&database).unwrap();
+        assert!(database_column_exists(&connection, "workspaces", "layout_json").unwrap());
+        assert!(database_column_exists(&connection, "panes", "exit_status").unwrap());
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            2
+        );
     }
 }
