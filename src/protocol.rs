@@ -9,7 +9,7 @@ use crate::model::{
     UsageSnapshot, WorkspaceSummary,
 };
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MIN_PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const REPLAY_CHUNK_BYTES: usize = 256 * 1024;
@@ -60,6 +60,9 @@ pub enum Request {
         pane_id: String,
         lines: usize,
     },
+    ResyncPane {
+        pane_id: String,
+    },
     ClosePane {
         pane_id: String,
     },
@@ -99,6 +102,10 @@ pub enum Request {
     DeleteSchedule {
         id: String,
     },
+    SetScheduleEnabled {
+        id: String,
+        enabled: bool,
+    },
     RunSchedule {
         id: String,
     },
@@ -127,6 +134,7 @@ pub enum Response {
     StateSnapshot {
         workspaces: Vec<WorkspaceSummary>,
         attention: Vec<AttentionEvent>,
+        /// Kept empty for protocol-v3 compatibility; usage has no v1 TUI surface.
         usage: Vec<UsageSnapshot>,
     },
     Output {
@@ -138,6 +146,7 @@ pub enum Response {
     PaneSnapshot {
         pane_id: String,
         data: Vec<u8>,
+        /// The next live output sequence after this complete snapshot.
         sequence: u64,
         reset: bool,
     },
@@ -146,6 +155,12 @@ pub enum Response {
     },
     Attention {
         event: AttentionEvent,
+    },
+    AttentionSnapshot {
+        attention: Vec<AttentionEvent>,
+    },
+    WorkspaceRemoved {
+        workspace_id: String,
     },
     Capture {
         pane_id: String,
@@ -157,6 +172,7 @@ pub enum Response {
     ShutdownComplete {
         terminated_panes: usize,
     },
+    ServerStopping,
 }
 
 pub fn negotiate_protocol(client_min: u16, client_max: u16) -> Result<u16> {

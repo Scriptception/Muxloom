@@ -11,6 +11,7 @@ All notable changes are documented here. Muxloom follows Semantic Versioning.
 - Terminal-faithful cell rendering, cursor placement, mouse/paste/key passthrough, copy-mode scrolling, pane zoom, spatial layouts, exact PTY resizing, agent launchers, and configurable key bindings.
 - Persisted layout trees and attention events, workspace lifecycle and attention CLI parity, shell completions, man-page generation, stable JSON documentation, and daemon lifecycle documentation.
 - Protocol handshake/compatibility errors, chunked attach replay and lag resync, SQLite migrations/hardening, graceful shutdown, child reaping/exit status, schedule overlap protection, frame fuzzing, and release packaging with SBOMs/signatures/provenance.
+- Protocol v4 with a v3 compatibility window, explicit per-pane resynchronization, live workspace removal and attention snapshots, and schedule enable/disable controls.
 
 ### Changed
 

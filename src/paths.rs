@@ -31,8 +31,7 @@ impl AppPaths {
     pub fn ensure(&self) -> Result<()> {
         std::fs::create_dir_all(&self.config_dir).context("create config directory")?;
         std::fs::create_dir_all(&self.state_dir).context("create state directory")?;
-        std::fs::create_dir_all(&self.runtime_dir).context("create runtime directory")?;
-        set_private(&self.runtime_dir)?;
+        ensure_private_runtime_dir(&self.runtime_dir)?;
         Ok(())
     }
 
@@ -58,13 +57,32 @@ fn current_uid() -> String {
 }
 
 #[cfg(unix)]
-fn set_private(target: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+fn ensure_private_runtime_dir(target: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    match std::fs::symlink_metadata(target) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                anyhow::bail!("unsafe Muxloom runtime path: {}", target.display());
+            }
+            if metadata.uid() != nix::unistd::geteuid().as_raw() {
+                anyhow::bail!("Muxloom runtime directory is owned by another user");
+            }
+        }
+        Err(problem) if problem.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+                .create(target)
+                .context("create private runtime directory")?;
+        }
+        Err(problem) => return Err(problem).context("inspect runtime directory"),
+    }
     std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o700))
         .context("set private runtime directory permissions")
 }
 
 #[cfg(not(unix))]
-fn set_private(_target: &std::path::Path) -> Result<()> {
-    Ok(())
+fn ensure_private_runtime_dir(target: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(target).context("create runtime directory")
 }

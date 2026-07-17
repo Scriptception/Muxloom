@@ -13,11 +13,8 @@ use ratatui::{
 
 use crate::{
     config::{Config, KeymapConfig, LaunchTemplate},
-    integrations::{ConfigSource, HermesSnapshot, git_summary},
-    model::{
-        AgentState, AttentionEvent, LayoutNode, ScheduleRecord, SkillRecord, SplitAxis,
-        UsageSnapshot, WorkspaceSummary,
-    },
+    integrations::git_summary,
+    model::{AgentState, AttentionEvent, LayoutNode, ScheduleRecord, SplitAxis, WorkspaceSummary},
     protocol::{Request, Response},
 };
 
@@ -34,15 +31,10 @@ const WARNING: Color = Color::Rgb(255, 190, 92);
 const DANGER: Color = Color::Rgb(255, 107, 134);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum View {
     Workspace,
     Attention,
-    Usage,
-    Skills,
-    Config,
     Schedules,
-    Hermes,
     Help,
 }
 
@@ -55,15 +47,20 @@ pub enum Action {
     Quit,
 }
 
+struct ScheduleWizard {
+    step: u8,
+    name: String,
+    expression: String,
+    timezone: String,
+    cwd: String,
+    input: String,
+}
+
 pub struct App {
     pub workspace_id: String,
     pub workspaces: Vec<WorkspaceSummary>,
     pub attention: Vec<AttentionEvent>,
-    pub usage: Vec<UsageSnapshot>,
     pub schedules: Vec<ScheduleRecord>,
-    pub skills: Vec<SkillRecord>,
-    pub configs: Vec<ConfigSource>,
-    pub hermes: HermesSnapshot,
     pub view: View,
     pub selected_pane: usize,
     pub navigation: bool,
@@ -76,6 +73,7 @@ pub struct App {
     sequences: HashMap<String, u64>,
     last_sizes: HashMap<String, (u16, u16)>,
     pending_resizes: Vec<(String, u16, u16)>,
+    pending_resyncs: Vec<String>,
     scroll_offsets: HashMap<String, usize>,
     zoomed: bool,
     show_rail: bool,
@@ -83,10 +81,17 @@ pub struct App {
     mouse_enabled: bool,
     keymap: KeymapConfig,
     attention_index: usize,
+    schedule_index: usize,
+    confirm_schedule_delete: bool,
+    schedule_wizard: Option<ScheduleWizard>,
     leader_pending: bool,
     send_toggle_pending: bool,
     launcher_axis: Option<SplitAxis>,
     pending_workspace_name: Option<String>,
+    pending_launch_command: Option<Vec<String>>,
+    launch_cwds: Vec<String>,
+    launch_cwd_index: usize,
+    custom_launch_input: bool,
     launch_templates: Vec<LaunchTemplate>,
     prompt_history: Vec<String>,
     prompt_history_index: Option<usize>,
@@ -96,21 +101,18 @@ pub struct App {
     copy_search: String,
     copy_search_input: bool,
     visual_select: bool,
+    copy_anchor: Option<(u16, u16)>,
+    copy_cursor: (u16, u16),
     last_pane_rects: Vec<(String, Rect)>,
     last_workspace_rows: Vec<(String, Rect)>,
     pending_chord: Option<char>,
 }
 
 impl App {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         workspace_id: String,
         workspaces: Vec<WorkspaceSummary>,
         attention: Vec<AttentionEvent>,
-        usage: Vec<UsageSnapshot>,
-        skills: Vec<SkillRecord>,
-        configs: Vec<ConfigSource>,
-        hermes: HermesSnapshot,
         config: Config,
     ) -> Self {
         let mut parsers = HashMap::new();
@@ -118,6 +120,16 @@ impl App {
             parsers.insert(pane.id.clone(), vt100::Parser::new(30, 120, 5_000));
         }
         let persist_prompt_history = config.ui.prompt_history;
+        let mut launch_cwds =
+            discover_launch_cwds(&workspaces, &config.repo_roots, config.repo_scan_depth);
+        launch_cwds.extend(
+            config
+                .launchers
+                .iter()
+                .filter_map(|template| template.cwd.clone()),
+        );
+        launch_cwds.sort();
+        launch_cwds.dedup();
         let prompt_history = if persist_prompt_history {
             load_prompt_history().unwrap_or_default()
         } else {
@@ -127,11 +139,7 @@ impl App {
             workspace_id,
             workspaces,
             attention,
-            usage,
             schedules: Vec::new(),
-            skills,
-            configs,
-            hermes,
             view: View::Workspace,
             selected_pane: 0,
             navigation: true,
@@ -144,6 +152,7 @@ impl App {
             sequences: HashMap::new(),
             last_sizes: HashMap::new(),
             pending_resizes: Vec::new(),
+            pending_resyncs: Vec::new(),
             scroll_offsets: HashMap::new(),
             zoomed: false,
             show_rail: config.ui.workspace_rail,
@@ -151,10 +160,17 @@ impl App {
             mouse_enabled: config.ui.mouse,
             keymap: config.keymap,
             attention_index: 0,
+            schedule_index: 0,
+            confirm_schedule_delete: false,
+            schedule_wizard: None,
             leader_pending: false,
             send_toggle_pending: false,
             launcher_axis: None,
             pending_workspace_name: None,
+            pending_launch_command: None,
+            launch_cwds,
+            launch_cwd_index: 0,
+            custom_launch_input: false,
             launch_templates: config.launchers,
             prompt_history,
             prompt_history_index: None,
@@ -164,6 +180,8 @@ impl App {
             copy_search: String::new(),
             copy_search_input: false,
             visual_select: false,
+            copy_anchor: None,
+            copy_cursor: (0, 0),
             last_pane_rects: Vec::new(),
             last_workspace_rows: Vec::new(),
             pending_chord: None,
@@ -175,14 +193,13 @@ impl App {
             Response::StateSnapshot {
                 workspaces,
                 attention,
-                usage,
+                ..
             } => {
                 if !workspaces.is_empty() {
                     self.workspaces = workspaces;
                     self.ensure_parsers();
                 }
                 self.attention = attention;
-                self.usage = usage;
             }
             Response::Output {
                 pane_id,
@@ -191,11 +208,18 @@ impl App {
                 ..
             } => {
                 let expected = self.sequences.get(&pane_id).copied().unwrap_or(sequence);
-                if sequence != expected {
+                if sequence < expected {
+                    return;
+                }
+                if sequence > expected {
                     self.toast = format!(
                         "Output resync required for {}",
                         &pane_id[..8.min(pane_id.len())]
                     );
+                    if !self.pending_resyncs.contains(&pane_id) {
+                        self.pending_resyncs.push(pane_id);
+                    }
+                    return;
                 }
                 self.parsers
                     .entry(pane_id.clone())
@@ -242,6 +266,26 @@ impl App {
                 }
             }
             Response::Schedules { schedules } => self.schedules = schedules,
+            Response::AttentionSnapshot { attention } => {
+                self.attention = attention;
+                self.attention_index = self.attention_index.min(
+                    self.attention
+                        .iter()
+                        .filter(|event| event.read_at.is_none())
+                        .count()
+                        .saturating_sub(1),
+                );
+            }
+            Response::WorkspaceRemoved { workspace_id } => {
+                self.workspaces
+                    .retain(|workspace| workspace.id != workspace_id);
+                if self.workspace_id == workspace_id
+                    && let Some(workspace) = self.workspaces.last()
+                {
+                    self.workspace_id = workspace.id.clone();
+                    self.selected_pane = 0;
+                }
+            }
             Response::Error { message } => self.toast = format!("Error · {message}"),
             Response::WorkspaceCreated { workspace } => {
                 self.workspace_id = workspace.id.clone();
@@ -255,12 +299,17 @@ impl App {
             | Response::Hello { .. }
             | Response::Pong { .. }
             | Response::Capture { .. }
-            | Response::ShutdownComplete { .. } => {}
+            | Response::ShutdownComplete { .. }
+            | Response::ServerStopping => {}
         }
     }
 
     pub fn take_resizes(&mut self) -> Vec<(String, u16, u16)> {
         std::mem::take(&mut self.pending_resizes)
+    }
+
+    pub fn take_resyncs(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_resyncs)
     }
 
     pub fn process_paste(&self, text: String) -> Action {
@@ -343,6 +392,9 @@ impl App {
     }
 
     pub fn process_key(&mut self, key: KeyEvent) -> Action {
+        if self.schedule_wizard.is_some() {
+            return self.process_schedule_wizard(key);
+        }
         if self.copy_search_input {
             match key.code {
                 KeyCode::Enter => {
@@ -359,6 +411,65 @@ impl App {
                 KeyCode::Char(character) => self.copy_search.push(character),
                 _ => {}
             }
+            return Action::None;
+        }
+        if self.custom_launch_input {
+            match key.code {
+                KeyCode::Esc => {
+                    self.custom_launch_input = false;
+                    self.prompt.clear();
+                }
+                KeyCode::Backspace => {
+                    self.prompt.pop();
+                }
+                KeyCode::Char(character) => self.prompt.push(character),
+                KeyCode::Enter => match shell_words::split(self.prompt.trim()) {
+                    Ok(command) if !command.is_empty() => {
+                        self.custom_launch_input = false;
+                        self.prompt.clear();
+                        self.pending_launch_command = Some(command);
+                        self.toast = "Choose cwd · j/k select · Enter launch · Esc cancel".into();
+                    }
+                    _ => self.toast = "Custom command is empty or has invalid quoting".into(),
+                },
+                _ => {}
+            }
+            return Action::None;
+        }
+        if self.pending_launch_command.is_some() {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down if !self.launch_cwds.is_empty() => {
+                    self.launch_cwd_index = (self.launch_cwd_index + 1) % self.launch_cwds.len();
+                }
+                KeyCode::Char('k') | KeyCode::Up if !self.launch_cwds.is_empty() => {
+                    self.launch_cwd_index = self
+                        .launch_cwd_index
+                        .checked_sub(1)
+                        .unwrap_or(self.launch_cwds.len() - 1);
+                }
+                KeyCode::Enter => {
+                    let command = self.pending_launch_command.take().unwrap_or_default();
+                    let cwd = self
+                        .launch_cwds
+                        .get(self.launch_cwd_index)
+                        .cloned()
+                        .or_else(|| self.selected_pane().map(|pane| pane.cwd.clone()))
+                        .unwrap_or_else(|| ".".into());
+                    return self.finish_launch(command, cwd);
+                }
+                KeyCode::Esc => {
+                    self.pending_launch_command = None;
+                    self.launcher_axis = None;
+                    self.pending_workspace_name = None;
+                }
+                _ => {}
+            }
+            self.toast = format!(
+                "Launch cwd · {} · j/k select · Enter launch",
+                self.launch_cwds
+                    .get(self.launch_cwd_index)
+                    .map_or("current pane", String::as_str)
+            );
             return Action::None;
         }
         if self.send_toggle_pending {
@@ -393,6 +504,12 @@ impl App {
                 KeyCode::Char('2') if executable_on_path("claude") => Some(vec!["claude".into()]),
                 KeyCode::Char('3') if executable_on_path("codex") => Some(vec!["codex".into()]),
                 KeyCode::Char('4') if executable_on_path("hermes") => Some(vec!["hermes".into()]),
+                KeyCode::Char('0') => {
+                    self.custom_launch_input = true;
+                    self.prompt.clear();
+                    self.toast = "Custom command · Enter continue · Esc cancel".into();
+                    return Action::None;
+                }
                 KeyCode::Char(character @ 'a'..='z') => self
                     .launch_templates
                     .get(usize::from(character as u8 - b'a'))
@@ -404,10 +521,13 @@ impl App {
                 _ => None,
             };
             if let Some(command) = command {
-                self.launcher_axis = None;
-                return self.create_pane(axis, command);
+                let _ = axis;
+                self.launch_cwd_index = self.preferred_launch_cwd_index(&command);
+                self.pending_launch_command = Some(command);
+                self.toast = "Choose cwd · j/k select · Enter launch · Esc cancel".into();
+                return Action::None;
             }
-            self.toast = "Launcher · 1 shell · 2 claude · 3 codex · 4 hermes · Esc cancel".into();
+            self.toast = "Launcher · 1 shell · 2 claude · 3 codex · 4 hermes · 0 custom".into();
             return Action::None;
         }
         if self.pending_workspace_name.is_some() {
@@ -419,6 +539,12 @@ impl App {
                 KeyCode::Char('2') if executable_on_path("claude") => Some(vec!["claude".into()]),
                 KeyCode::Char('3') if executable_on_path("codex") => Some(vec!["codex".into()]),
                 KeyCode::Char('4') if executable_on_path("hermes") => Some(vec!["hermes".into()]),
+                KeyCode::Char('0') => {
+                    self.custom_launch_input = true;
+                    self.prompt.clear();
+                    self.toast = "Custom command · Enter continue · Esc cancel".into();
+                    return Action::None;
+                }
                 KeyCode::Char(character @ 'a'..='z') => self
                     .launch_templates
                     .get(usize::from(character as u8 - b'a'))
@@ -430,20 +556,10 @@ impl App {
                 _ => None,
             };
             if let Some(command) = command {
-                let name = self
-                    .pending_workspace_name
-                    .take()
-                    .unwrap_or_else(|| "workspace".into());
-                let cwd = self
-                    .selected_pane()
-                    .map(|pane| pane.cwd.clone())
-                    .unwrap_or_else(|| ".".into());
-                return Action::Send(Request::CreateWorkspace {
-                    name,
-                    cwd,
-                    command,
-                    respawn: false,
-                });
+                self.launch_cwd_index = self.preferred_launch_cwd_index(&command);
+                self.pending_launch_command = Some(command);
+                self.toast = "Choose cwd · j/k select · Enter launch · Esc cancel".into();
+                return Action::None;
             }
             self.toast = "Workspace launcher · 1 shell · 2 claude · 3 codex · 4 hermes".into();
             return Action::None;
@@ -491,7 +607,8 @@ impl App {
             match key.code {
                 KeyCode::Char('a') => self.set_view(View::Attention),
                 KeyCode::Char('s') => {
-                    self.toast = "Schedules are managed with `muxloom schedule`".into()
+                    self.set_view(View::Schedules);
+                    return Action::Send(Request::ListSchedules);
                 }
                 KeyCode::Char('?') => self.set_view(View::Help),
                 KeyCode::Char('t') => {
@@ -502,9 +619,6 @@ impl App {
                 _ => self.toast = "Unknown leader command".into(),
             }
             return Action::None;
-        }
-        if binding_matches(key, &self.keymap.detach) {
-            return Action::Quit;
         }
         if binding_matches(key, &self.keymap.leader) {
             self.leader_pending = true;
@@ -597,6 +711,142 @@ impl App {
                 _ => {}
             }
         }
+        if self.view == View::Schedules {
+            if self.confirm_schedule_delete {
+                self.confirm_schedule_delete = false;
+                return if matches!(key.code, KeyCode::Char('y' | 'Y')) {
+                    self.schedules
+                        .get(self.schedule_index)
+                        .map(|schedule| {
+                            Action::Send(Request::DeleteSchedule {
+                                id: schedule.id.clone(),
+                            })
+                        })
+                        .unwrap_or(Action::None)
+                } else {
+                    self.toast = "Schedule deletion cancelled".into();
+                    Action::None
+                };
+            }
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if !self.schedules.is_empty() {
+                        self.schedule_index = (self.schedule_index + 1) % self.schedules.len();
+                    }
+                    return Action::None;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if !self.schedules.is_empty() {
+                        self.schedule_index = self
+                            .schedule_index
+                            .checked_sub(1)
+                            .unwrap_or(self.schedules.len() - 1);
+                    }
+                    return Action::None;
+                }
+                KeyCode::Char('n') => {
+                    let cwd = self
+                        .selected_pane()
+                        .map(|pane| pane.cwd.clone())
+                        .unwrap_or_else(|| ".".into());
+                    self.schedule_wizard = Some(ScheduleWizard {
+                        step: 0,
+                        name: String::new(),
+                        expression: String::new(),
+                        timezone: "local".into(),
+                        cwd,
+                        input: String::new(),
+                    });
+                    return Action::None;
+                }
+                KeyCode::Char('e') => {
+                    return self
+                        .schedules
+                        .get(self.schedule_index)
+                        .map(|schedule| {
+                            Action::Send(Request::SetScheduleEnabled {
+                                id: schedule.id.clone(),
+                                enabled: !schedule.enabled,
+                            })
+                        })
+                        .unwrap_or(Action::None);
+                }
+                KeyCode::Char('r') => {
+                    return self
+                        .schedules
+                        .get(self.schedule_index)
+                        .map(|schedule| {
+                            Action::Send(Request::RunSchedule {
+                                id: schedule.id.clone(),
+                            })
+                        })
+                        .unwrap_or(Action::None);
+                }
+                KeyCode::Char('d') => {
+                    self.confirm_schedule_delete = !self.schedules.is_empty();
+                    self.toast = "Delete selected schedule? y confirms".into();
+                    return Action::None;
+                }
+                KeyCode::Esc => {
+                    self.set_view(View::Workspace);
+                    return Action::None;
+                }
+                _ => {}
+            }
+        }
+        if binding_matches(key, &self.keymap.detach) {
+            return Action::Quit;
+        }
+        if self.visual_select {
+            match key.code {
+                KeyCode::Char('h') | KeyCode::Left => {
+                    self.copy_cursor.1 = self.copy_cursor.1.saturating_sub(1);
+                    return Action::None;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.copy_cursor.0 = self.copy_cursor.0.saturating_add(1);
+                    return Action::None;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.copy_cursor.0 = self.copy_cursor.0.saturating_sub(1);
+                    return Action::None;
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    self.copy_cursor.1 = self.copy_cursor.1.saturating_add(1);
+                    return Action::None;
+                }
+                KeyCode::Esc => {
+                    self.visual_select = false;
+                    self.copy_anchor = None;
+                    return Action::None;
+                }
+                _ => {}
+            }
+        }
+        if self.view == View::Workspace {
+            if binding_matches(key, &self.keymap.focus_down) {
+                self.select_spatial(0, 1);
+                return Action::None;
+            }
+            if binding_matches(key, &self.keymap.focus_up) {
+                self.select_spatial(0, -1);
+                return Action::None;
+            }
+            if binding_matches(key, &self.keymap.focus_left) {
+                self.select_spatial(-1, 0);
+                return Action::None;
+            }
+            if binding_matches(key, &self.keymap.focus_right) {
+                self.select_spatial(1, 0);
+                return Action::None;
+            }
+            if binding_matches(key, &self.keymap.workspace_previous) {
+                return self.switch_workspace(false);
+            }
+            if binding_matches(key, &self.keymap.workspace_next) {
+                return self.switch_workspace(true);
+            }
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('/'), _)
                 if self
@@ -621,6 +871,12 @@ impl App {
                     > 0 =>
             {
                 self.visual_select = true;
+                if let Some(pane_id) = self.selected_pane_id()
+                    && let Some(parser) = self.parsers.get(&pane_id)
+                {
+                    self.copy_cursor = parser.screen().cursor_position();
+                    self.copy_anchor = Some(self.copy_cursor);
+                }
                 self.toast = "Visual copy selection · y yank visible selection".into();
             }
             (KeyCode::Char('y'), _) if self.visual_select => {
@@ -628,8 +884,13 @@ impl App {
                 if let Some(pane_id) = self.selected_pane_id()
                     && let Some(parser) = self.parsers.get(&pane_id)
                 {
-                    let encoded = base64::engine::general_purpose::STANDARD
-                        .encode(parser.screen().contents());
+                    let selected = selected_text(
+                        parser.screen(),
+                        self.copy_anchor.unwrap_or((0, 0)),
+                        self.copy_cursor,
+                    );
+                    self.copy_anchor = None;
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(selected);
                     return Action::Osc52(format!("\x1b]52;c;{encoded}\x07"));
                 }
             }
@@ -657,18 +918,12 @@ impl App {
                     });
                 }
             }
-            (KeyCode::Char('A'), _) => self.set_view(View::Attention),
+            (_, _) if binding_matches(key, &self.keymap.attention) => {
+                self.set_view(View::Attention)
+            }
             (KeyCode::Char('?'), _) => self.set_view(View::Help),
-            (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => self.select_spatial(0, 1),
-            (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => self.select_spatial(0, -1),
-            (KeyCode::BackTab, _) => {
-                return self.switch_workspace(false);
-            }
-            (KeyCode::Tab, _) => {
-                return self.switch_workspace(true);
-            }
-            (KeyCode::Char('h'), _) => self.select_spatial(-1, 0),
-            (KeyCode::Char('l'), _) => self.select_spatial(1, 0),
+            (KeyCode::Down, KeyModifiers::NONE) => self.select_spatial(0, 1),
+            (KeyCode::Up, KeyModifiers::NONE) => self.select_spatial(0, -1),
             (KeyCode::Char('g'), _)
                 if self
                     .selected_pane_id()
@@ -705,22 +960,31 @@ impl App {
                 self.navigation = false;
                 self.toast = "Agent focus · Ctrl-\\ or F12 to return".into();
             }
-            (KeyCode::Char('p'), _) if self.view == View::Workspace => {
+            (_, _) if self.view == View::Workspace && binding_matches(key, &self.keymap.prompt) => {
                 self.prompt_mode = true;
                 self.creating_workspace = false;
                 self.prompt.clear();
             }
-            (KeyCode::Char('c'), _) if self.view == View::Workspace => {
+            (_, _)
+                if self.view == View::Workspace
+                    && binding_matches(key, &self.keymap.new_workspace) =>
+            {
                 self.prompt_mode = true;
                 self.creating_workspace = true;
                 self.prompt.clear();
                 self.toast = "Name the new workspace".into();
             }
-            (KeyCode::Char('v'), _) if self.view == View::Workspace => {
+            (_, _)
+                if self.view == View::Workspace
+                    && binding_matches(key, &self.keymap.split_vertical) =>
+            {
                 self.launcher_axis = Some(SplitAxis::Vertical);
                 self.toast = "Vertical split · 1 shell · 2 claude · 3 codex · 4 hermes".into();
             }
-            (KeyCode::Char('s'), _) if self.view == View::Workspace => {
+            (_, _)
+                if self.view == View::Workspace
+                    && binding_matches(key, &self.keymap.split_horizontal) =>
+            {
                 self.launcher_axis = Some(SplitAxis::Horizontal);
                 self.toast = "Horizontal split · 1 shell · 2 claude · 3 codex · 4 hermes".into();
             }
@@ -744,7 +1008,10 @@ impl App {
             {
                 return self.resize_selected(5);
             }
-            (KeyCode::Char('x'), _) if self.view == View::Workspace => {
+            (_, _)
+                if self.view == View::Workspace
+                    && binding_matches(key, &self.keymap.close_pane) =>
+            {
                 if self.selected_pane_id().is_some() {
                     self.confirm_close = true;
                     self.toast = "Close selected pane? y confirms · any key cancels".into();
@@ -889,16 +1156,121 @@ impl App {
         }
     }
 
+    fn process_schedule_wizard(&mut self, key: KeyEvent) -> Action {
+        let Some(mut wizard) = self.schedule_wizard.take() else {
+            return Action::None;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.toast = "Schedule creation cancelled".into();
+                Action::None
+            }
+            KeyCode::Backspace => {
+                wizard.input.pop();
+                self.schedule_wizard = Some(wizard);
+                Action::None
+            }
+            KeyCode::Char(character) => {
+                wizard.input.push(character);
+                self.schedule_wizard = Some(wizard);
+                Action::None
+            }
+            KeyCode::Enter => {
+                let value = wizard.input.trim().to_string();
+                match wizard.step {
+                    0 if !value.is_empty() => wizard.name = value,
+                    1 if !value.is_empty() => wizard.expression = value,
+                    2 => {
+                        wizard.timezone = if value.is_empty() {
+                            "local".into()
+                        } else {
+                            value
+                        }
+                    }
+                    3 => {
+                        if !value.is_empty() {
+                            wizard.cwd = value;
+                        }
+                    }
+                    4 => {
+                        let Ok(command) = shell_words::split(&value) else {
+                            wizard.input = value;
+                            self.toast = "Schedule command has invalid quoting".into();
+                            self.schedule_wizard = Some(wizard);
+                            return Action::None;
+                        };
+                        if command.is_empty() {
+                            self.toast = "Schedule command cannot be empty".into();
+                            self.schedule_wizard = Some(wizard);
+                            return Action::None;
+                        }
+                        return Action::Send(Request::CreateSchedule {
+                            schedule: ScheduleRecord {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                name: wizard.name,
+                                expression: wizard.expression,
+                                timezone: wizard.timezone,
+                                cwd: wizard.cwd,
+                                command,
+                                enabled: true,
+                                last_run_at: None,
+                                next_run_at: None,
+                            },
+                        });
+                    }
+                    _ => {
+                        self.toast = "This schedule field is required".into();
+                        self.schedule_wizard = Some(wizard);
+                        return Action::None;
+                    }
+                }
+                wizard.step = wizard.step.saturating_add(1);
+                wizard.input.clear();
+                self.schedule_wizard = Some(wizard);
+                Action::None
+            }
+            _ => {
+                self.schedule_wizard = Some(wizard);
+                Action::None
+            }
+        }
+    }
+
     fn set_view(&mut self, view: View) {
         self.view = view;
         self.toast = view_label(view).to_string();
     }
 
-    fn create_pane(&self, axis: SplitAxis, command: Vec<String>) -> Action {
-        let cwd = self
-            .selected_pane()
-            .map(|pane| pane.cwd.clone())
-            .unwrap_or_else(|| ".".into());
+    fn finish_launch(&mut self, command: Vec<String>, cwd: String) -> Action {
+        if let Some(axis) = self.launcher_axis.take() {
+            return self.create_pane(axis, command, cwd);
+        }
+        let name = self
+            .pending_workspace_name
+            .take()
+            .unwrap_or_else(|| "workspace".into());
+        Action::Send(Request::CreateWorkspace {
+            name,
+            cwd,
+            command,
+            respawn: false,
+        })
+    }
+
+    fn preferred_launch_cwd_index(&self, command: &[String]) -> usize {
+        self.launch_templates
+            .iter()
+            .find(|template| template.command == command)
+            .and_then(|template| template.cwd.as_ref())
+            .and_then(|cwd| {
+                self.launch_cwds
+                    .iter()
+                    .position(|candidate| candidate == cwd)
+            })
+            .unwrap_or(0)
+    }
+
+    fn create_pane(&self, axis: SplitAxis, command: Vec<String>, cwd: String) -> Action {
         Action::Send(Request::CreatePane {
             workspace_id: self.workspace_id.clone(),
             cwd,
@@ -1110,64 +1482,21 @@ impl App {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
                 Constraint::Min(8),
-                Constraint::Length(if self.prompt_mode { 4 } else { 2 }),
+                Constraint::Length(
+                    if self.prompt_mode
+                        || self.schedule_wizard.is_some()
+                        || self.custom_launch_input
+                    {
+                        3
+                    } else {
+                        1
+                    },
+                ),
             ])
             .split(area);
-        self.render_header(frame, rows[0]);
-        self.render_body(frame, rows[1]);
-        self.render_footer(frame, rows[2]);
-    }
-
-    fn render_header(&self, frame: &mut Frame, area: Rect) {
-        let attention = self
-            .attention
-            .iter()
-            .filter(|event| event.read_at.is_none())
-            .count();
-        let working = self.current_workspace().map_or(0, |workspace| {
-            workspace
-                .panes
-                .iter()
-                .filter(|pane| matches!(pane.state, AgentState::Starting | AgentState::Working))
-                .count()
-        });
-        let workspace = self
-            .current_workspace()
-            .map_or("No workspace", |workspace| workspace.name.as_str());
-        let line = Line::from(vec![
-            Span::styled(
-                "  MUX",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "LOOM",
-                Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {workspace}"),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("    ● {working} working"),
-                Style::default().fg(SUCCESS),
-            ),
-            Span::styled(
-                format!("    ◆ {attention} attention"),
-                Style::default().fg(if attention > 0 { WARNING } else { MUTED }),
-            ),
-        ]);
-        frame.render_widget(
-            Paragraph::new(line)
-                .block(
-                    Block::default()
-                        .borders(Borders::BOTTOM)
-                        .border_style(Style::default().fg(BORDER)),
-                )
-                .style(Style::default().bg(SURFACE)),
-            area,
-        );
+        self.render_body(frame, rows[0]);
+        self.render_footer(frame, rows[1]);
     }
 
     fn render_body(&mut self, frame: &mut Frame, area: Rect) {
@@ -1195,11 +1524,7 @@ impl App {
         match self.view {
             View::Workspace => self.render_terminals(frame, columns[center_index]),
             View::Attention => self.render_attention(frame, columns[center_index]),
-            View::Usage => self.render_usage(frame, columns[center_index]),
-            View::Skills => self.render_skills(frame, columns[center_index]),
-            View::Config => self.render_config(frame, columns[center_index]),
             View::Schedules => self.render_schedules(frame, columns[center_index]),
-            View::Hermes => self.render_hermes(frame, columns[center_index]),
             View::Help => self.render_help(frame, columns[center_index]),
         }
         if show_context {
@@ -1394,7 +1719,13 @@ impl App {
                     .border_style(Style::default().fg(border)),
                 section,
             );
-            render_vt100(frame, inner, parser.screen(), &self.copy_search);
+            let selection = (selected && self.visual_select).then(|| {
+                (
+                    self.copy_anchor.unwrap_or(self.copy_cursor),
+                    self.copy_cursor,
+                )
+            });
+            render_vt100(frame, inner, parser.screen(), &self.copy_search, selection);
             if selected && !self.navigation && !parser.screen().hide_cursor() {
                 let (row, col) = parser.screen().cursor_position();
                 if row < inner.height && col < inner.width {
@@ -1506,120 +1837,10 @@ impl App {
         }
     }
 
-    fn render_usage(&self, frame: &mut Frame, area: Rect) {
-        let rows = self.current_workspace().map_or_else(Vec::new, |workspace| {
-            workspace
-                .panes
-                .iter()
-                .map(|pane| {
-                    let usage = self.usage.iter().find(|usage| usage.pane_id == pane.id);
-                    let elapsed = usage.map_or(0, |usage| usage.elapsed_seconds);
-                    let tokens = usage
-                        .and_then(|usage| usage.input_tokens.zip(usage.output_tokens))
-                        .map_or_else(
-                            || "tokens unavailable".into(),
-                            |(input, output)| format!("{input} in · {output} out"),
-                        );
-                    ListItem::new(vec![
-                        Line::from(vec![
-                            Span::styled(
-                                pane.title.clone(),
-                                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                format!("  {}", pane.provider),
-                                Style::default().fg(VIOLET),
-                            ),
-                        ]),
-                        Line::styled(
-                            format!("{}m {:02}s · {tokens}", elapsed / 60, elapsed % 60),
-                            Style::default().fg(MUTED),
-                        ),
-                        Line::default(),
-                    ])
-                })
-                .collect()
-        });
-        frame.render_widget(
-            List::new(rows).block(section_block("USAGE · PROVIDER-REPORTED ONLY")),
-            area,
-        );
-    }
-
-    fn render_skills(&self, frame: &mut Frame, area: Rect) {
-        let rows = self
-            .skills
-            .iter()
-            .map(|skill| {
-                ListItem::new(vec![
-                    Line::from(vec![
-                        Span::styled(
-                            if skill.valid { "✓ " } else { "! " },
-                            Style::default().fg(if skill.valid { SUCCESS } else { DANGER }),
-                        ),
-                        Span::styled(
-                            skill.name.clone(),
-                            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(format!("  {}", skill.provider), Style::default().fg(VIOLET)),
-                    ]),
-                    Line::styled(skill.description.clone(), Style::default().fg(MUTED)),
-                    Line::styled(skill.location.clone(), Style::default().fg(BORDER)),
-                    Line::default(),
-                ])
-            })
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            List::new(rows).block(section_block(&format!(
-                "SKILLS · {} DISCOVERED",
-                self.skills.len()
-            ))),
-            area,
-        );
-    }
-
-    fn render_config(&self, frame: &mut Frame, area: Rect) {
-        let rows = self
-            .configs
-            .iter()
-            .map(|source| {
-                ListItem::new(vec![
-                    Line::from(vec![
-                        Span::styled(
-                            if source.present { "● " } else { "○ " },
-                            Style::default().fg(if source.present { SUCCESS } else { MUTED }),
-                        ),
-                        Span::styled(
-                            source.provider.to_uppercase(),
-                            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            if source.writable {
-                                "  writable"
-                            } else {
-                                "  read-only"
-                            },
-                            Style::default().fg(if source.writable { ACCENT } else { WARNING }),
-                        ),
-                    ]),
-                    Line::styled(
-                        source.location.display().to_string(),
-                        Style::default().fg(MUTED),
-                    ),
-                    Line::default(),
-                ])
-            })
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            List::new(rows).block(section_block("CONFIGURATION · SECRETS REDACTED")),
-            area,
-        );
-    }
-
     fn render_schedules(&self, frame: &mut Frame, area: Rect) {
         if self.schedules.is_empty() {
             frame.render_widget(
-                empty_state("No schedules", "Create one with muxloom schedule add"),
+                empty_state("No schedules", "Press n to create a schedule"),
                 area,
             );
             return;
@@ -1652,66 +1873,16 @@ impl App {
                 ])
             })
             .collect::<Vec<_>>();
-        frame.render_widget(
-            List::new(rows).block(section_block("SCHEDULES · NO OVERLAP")),
+        let mut state = ListState::default()
+            .with_selected(Some(self.schedule_index.min(rows.len().saturating_sub(1))));
+        frame.render_stateful_widget(
+            List::new(rows)
+                .highlight_style(Style::default().bg(RAISED).fg(ACCENT))
+                .block(section_block(
+                    "SCHEDULES · n new · e enable · r run · d delete · NO OVERLAP",
+                )),
             area,
-        );
-    }
-
-    fn render_hermes(&self, frame: &mut Frame, area: Rect) {
-        if !self.hermes.available {
-            frame.render_widget(
-                empty_state(
-                    "Hermes not found",
-                    "Install Hermes Agent to enable this control surface",
-                ),
-                area,
-            );
-            return;
-        }
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(5),
-                Constraint::Percentage(42),
-                Constraint::Percentage(58),
-            ])
-            .split(area);
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled(
-                    self.hermes.version.clone(),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Line::styled(
-                    "Terminal-native status · no web services started",
-                    Style::default().fg(MUTED),
-                ),
-            ])
-            .block(section_block("HERMES")),
-            rows[0],
-        );
-        frame.render_widget(
-            Paragraph::new(self.hermes.status.clone())
-                .wrap(Wrap { trim: false })
-                .block(section_block("COMPONENTS")),
-            rows[1],
-        );
-        let bottom = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(rows[2]);
-        frame.render_widget(
-            Paragraph::new(self.hermes.sessions.clone())
-                .wrap(Wrap { trim: false })
-                .block(section_block("SESSIONS")),
-            bottom[0],
-        );
-        frame.render_widget(
-            Paragraph::new(self.hermes.insights.clone())
-                .wrap(Wrap { trim: false })
-                .block(section_block("7-DAY INSIGHTS")),
-            bottom[1],
+            &mut state,
         );
     }
 
@@ -1729,8 +1900,8 @@ impl App {
             Line::raw("v / s       split with a new shell"),
             Line::raw("p           quick prompt composer"),
             Line::raw("[a / ]a     previous / next attention"),
-            Line::raw("1…7         workspace and control views"),
             Line::raw("A           attention queue"),
+            Line::raw("Space+s     schedules"),
             Line::raw("q           detach safely"),
             Line::default(),
             Line::styled(
@@ -1750,6 +1921,41 @@ impl App {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        if self.custom_launch_input {
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(self.prompt.as_str())
+                    .block(
+                        Block::default()
+                            .title(" CUSTOM COMMAND · Enter continue · Esc cancel ")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(ACCENT)),
+                    )
+                    .style(Style::default().fg(TEXT).bg(RAISED)),
+                area,
+            );
+            return;
+        }
+        if let Some(wizard) = &self.schedule_wizard {
+            const LABELS: [&str; 5] = ["NAME", "CRON", "TIMEZONE", "WORKING DIRECTORY", "COMMAND"];
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(wizard.input.as_str())
+                    .block(
+                        Block::default()
+                            .title(format!(
+                                " NEW SCHEDULE {}/5 · {} · Enter next · Esc cancel ",
+                                wizard.step + 1,
+                                LABELS[usize::from(wizard.step).min(LABELS.len() - 1)]
+                            ))
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(ACCENT)),
+                    )
+                    .style(Style::default().fg(TEXT).bg(RAISED)),
+                area,
+            );
+            return;
+        }
         if self.prompt_mode {
             let title = if self.creating_workspace {
                 " NEW WORKSPACE · Enter to create · Esc to cancel "
@@ -1771,6 +1977,14 @@ impl App {
             return;
         }
         let mode = if self.navigation { " NAV " } else { " AGENT " };
+        let workspace = self
+            .current_workspace()
+            .map_or("No workspace", |workspace| workspace.name.as_str());
+        let attention = self
+            .attention
+            .iter()
+            .filter(|event| event.read_at.is_none())
+            .count();
         let hints = if self.navigation && area.width < 100 {
             " h/l ws   j/k pane   c new   v/s split   Enter focus   q detach "
         } else if self.navigation {
@@ -1781,11 +1995,19 @@ impl App {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
+                    " MUXLOOM ",
+                    Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
                     mode,
                     Style::default()
                         .fg(INK)
                         .bg(if self.navigation { ACCENT } else { VIOLET })
                         .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {workspace} · ◆{attention} "),
+                    Style::default().fg(if attention > 0 { WARNING } else { MUTED }),
                 ),
                 Span::styled(hints, Style::default().fg(MUTED)),
                 Span::styled(format!(" · {}", self.toast), Style::default().fg(TEXT)),
@@ -1887,7 +2109,13 @@ fn terminal_color(color: vt100::Color, fallback: Color) -> Color {
     }
 }
 
-fn render_vt100(frame: &mut Frame, area: Rect, screen: &vt100::Screen, search: &str) {
+fn render_vt100(
+    frame: &mut Frame,
+    area: Rect,
+    screen: &vt100::Screen,
+    search: &str,
+    selection: Option<((u16, u16), (u16, u16))>,
+) {
     for row in 0..area.height {
         let row_matches = !search.is_empty()
             && (0..area.width)
@@ -1908,9 +2136,17 @@ fn render_vt100(frame: &mut Frame, area: Rect, screen: &vt100::Screen, search: &
             if source.inverse() {
                 std::mem::swap(&mut foreground, &mut background);
             }
-            if row_matches {
+            let selected = selection.is_some_and(|(start, end)| {
+                let (start, end) = if start <= end {
+                    (start, end)
+                } else {
+                    (end, start)
+                };
+                (row, col) >= start && (row, col) <= end
+            });
+            if row_matches || selected {
                 foreground = INK;
-                background = WARNING;
+                background = if selected { ACCENT } else { WARNING };
             }
             let mut modifiers = Modifier::empty();
             if source.bold() {
@@ -1940,6 +2176,39 @@ fn render_vt100(frame: &mut Frame, area: Rect, screen: &vt100::Screen, search: &
             }
         }
     }
+}
+
+fn selected_text(screen: &vt100::Screen, start: (u16, u16), end: (u16, u16)) -> String {
+    let (start, end) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    let (rows, cols) = screen.size();
+    let mut selected = String::new();
+    for row in start.0.min(rows.saturating_sub(1))..=end.0.min(rows.saturating_sub(1)) {
+        let first = if row == start.0 { start.1 } else { 0 };
+        let last = if row == end.0 {
+            end.1.min(cols.saturating_sub(1))
+        } else {
+            cols.saturating_sub(1)
+        };
+        for col in first..=last {
+            if let Some(cell) = screen.cell(row, col)
+                && !cell.is_wide_continuation()
+            {
+                selected.push_str(if cell.has_contents() {
+                    cell.contents()
+                } else {
+                    " "
+                });
+            }
+        }
+        if row != end.0 {
+            selected.push('\n');
+        }
+    }
+    selected.trim_end_matches(' ').to_string()
 }
 
 fn empty_state<'a>(title: &'a str, detail: &'a str) -> Paragraph<'a> {
@@ -1994,37 +2263,39 @@ const fn view_label(view: View) -> &'static str {
     match view {
         View::Workspace => "Workspace",
         View::Attention => "Attention queue",
-        View::Usage => "Usage",
-        View::Skills => "Skills",
-        View::Config => "Configuration",
         View::Schedules => "Schedules",
-        View::Hermes => "Hermes",
         View::Help => "Help",
     }
 }
 
 fn is_navigation_toggle(key: KeyEvent, configured: &str) -> bool {
-    if configured.eq_ignore_ascii_case("f12") {
-        return key.code == KeyCode::F(12);
-    }
-    key.code == KeyCode::F(12)
+    binding_matches(key, configured)
+        || key.code == KeyCode::F(12)
         || (key.modifiers.contains(KeyModifiers::CONTROL)
+            && configured.eq_ignore_ascii_case("ctrl-\\")
             && matches!(key.code, KeyCode::Char('\\' | '4')))
 }
 
 fn binding_matches(key: KeyEvent, configured: &str) -> bool {
-    let configured = configured.to_ascii_lowercase();
-    if configured == "space" {
+    let configured = configured.trim();
+    let normalized = configured.to_ascii_lowercase();
+    if normalized == "tab" {
+        return key.code == KeyCode::Tab && key.modifiers.is_empty();
+    }
+    if normalized == "shift-tab" {
+        return key.code == KeyCode::BackTab;
+    }
+    if normalized == "space" {
         return key.code == KeyCode::Char(' ') && key.modifiers.is_empty();
     }
-    if let Some(character) = configured
+    if let Some(character) = normalized
         .strip_prefix("ctrl-")
         .and_then(|value| value.chars().next())
     {
         return key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char(actual) if actual.to_ascii_lowercase() == character);
     }
-    if let Some(number) = configured
+    if let Some(number) = normalized
         .strip_prefix('f')
         .and_then(|value| value.parse::<u8>().ok())
     {
@@ -2033,7 +2304,8 @@ fn binding_matches(key: KeyEvent, configured: &str) -> bool {
     configured.chars().next().is_some_and(|character| {
         configured.chars().count() == 1
             && key.code == KeyCode::Char(character)
-            && key.modifiers.is_empty()
+            && (key.modifiers.is_empty()
+                || (character.is_uppercase() && key.modifiers == KeyModifiers::SHIFT))
     })
 }
 
@@ -2125,6 +2397,49 @@ fn executable_on_path(program: &str) -> bool {
     })
 }
 
+fn discover_launch_cwds(
+    workspaces: &[WorkspaceSummary],
+    configured_roots: &[String],
+    max_depth: usize,
+) -> Vec<String> {
+    let mut result = workspaces
+        .iter()
+        .flat_map(|workspace| workspace.panes.iter().map(|pane| pane.cwd.clone()))
+        .collect::<Vec<_>>();
+    let home = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+    let mut pending = configured_roots
+        .iter()
+        .filter_map(|root| {
+            let expanded = root
+                .strip_prefix("~/")
+                .and_then(|suffix| home.as_ref().map(|home| home.join(suffix)));
+            expanded.or_else(|| Some(std::path::PathBuf::from(root)))
+        })
+        .map(|path| (path, 0usize))
+        .collect::<Vec<_>>();
+    while let Some((path, depth)) = pending.pop() {
+        if path.join(".git").exists() {
+            result.push(path.display().to_string());
+            continue;
+        }
+        if depth >= max_depth {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(&path) {
+            pending.extend(entries.flatten().filter_map(|entry| {
+                entry
+                    .file_type()
+                    .ok()
+                    .is_some_and(|kind| kind.is_dir() && !kind.is_symlink())
+                    .then(|| (entry.path(), depth + 1))
+            }));
+        }
+    }
+    result.sort();
+    result.dedup();
+    result
+}
+
 fn persist_prompt_history(history: &[String]) -> std::io::Result<()> {
     let state_home = std::env::var_os("XDG_STATE_HOME")
         .map(std::path::PathBuf::from)
@@ -2174,6 +2489,14 @@ mod tests {
     }
 
     #[test]
+    fn uppercase_configured_binding_accepts_shifted_key() {
+        assert!(binding_matches(
+            KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
+            "A"
+        ));
+    }
+
+    #[test]
     fn navigation_toggle_accepts_unix_control_backslash_encoding() {
         assert!(is_navigation_toggle(
             KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL),
@@ -2220,10 +2543,6 @@ mod tests {
                 schedule_id: None,
             }],
             Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            HermesSnapshot::default(),
             Config::default(),
         );
 
@@ -2261,10 +2580,6 @@ mod tests {
             first.id.clone(),
             vec![first, second],
             Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            HermesSnapshot::default(),
             Config::default(),
         );
 
@@ -2293,6 +2608,10 @@ mod tests {
         ));
         assert!(matches!(
             app.process_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            Action::None
+        ));
+        assert!(matches!(
+            app.process_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Action::Send(Request::CreateWorkspace { name, command, .. })
                 if name == "Review" && !command.is_empty()
         ));
@@ -2327,16 +2646,7 @@ mod tests {
                 respawn: false,
                 schedule_id: None,
             };
-            let mut app = App::new(
-                workspace_id,
-                vec![workspace],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                HermesSnapshot::default(),
-                Config::default(),
-            );
+            let mut app = App::new(workspace_id, vec![workspace], Vec::new(), Config::default());
             app.apply(Response::Output {
                 workspace_id: "workspace-id".into(),
                 pane_id: "pane-id".into(),

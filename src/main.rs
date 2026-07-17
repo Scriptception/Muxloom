@@ -47,6 +47,16 @@ enum Command {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
+    /// Rename a workspace (shortcut for `workspace rename`).
+    Rename { workspace: String, name: String },
+    /// Terminate and remove a workspace (shortcut for `workspace kill`).
+    Kill {
+        workspace: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove exited pane history (shortcut for `workspace prune`).
+    Prune { workspace: Option<String> },
     /// Inspect and update the persisted attention queue.
     Attention {
         #[command(subcommand)]
@@ -248,6 +258,12 @@ enum ScheduleCommand {
     Run {
         id: String,
     },
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -326,6 +342,15 @@ async fn main() -> Result<()> {
         Some(Command::Attach(arguments)) => attach_workspace(&paths, arguments).await,
         Some(Command::List { json }) => list_workspaces(&paths, json).await,
         Some(Command::Workspace { command }) => workspace_command(&paths, command).await,
+        Some(Command::Rename { workspace, name }) => {
+            workspace_command(&paths, WorkspaceCommand::Rename { workspace, name }).await
+        }
+        Some(Command::Kill { workspace, force }) => {
+            workspace_command(&paths, WorkspaceCommand::Kill { workspace, force }).await
+        }
+        Some(Command::Prune { workspace }) => {
+            workspace_command(&paths, WorkspaceCommand::Prune { workspace }).await
+        }
         Some(Command::Attention { command }) => attention_command(&paths, command).await,
         Some(Command::Completions { shell }) => {
             clap_complete::generate(
@@ -509,7 +534,10 @@ async fn workspace_command(paths: &AppPaths, command: WorkspaceCommand) -> Resul
         }
     };
     match client::request(paths, request).await? {
-        Response::Ok | Response::PaneUpdated { .. } | Response::StateSnapshot { .. } => Ok(()),
+        Response::Ok
+        | Response::PaneUpdated { .. }
+        | Response::WorkspaceRemoved { .. }
+        | Response::StateSnapshot { .. } => Ok(()),
         Response::Error { message } => bail!(message),
         response => bail!("unexpected daemon response: {response:?}"),
     }
@@ -518,7 +546,7 @@ async fn workspace_command(paths: &AppPaths, command: WorkspaceCommand) -> Resul
 async fn attention_command(paths: &AppPaths, command: AttentionCommand) -> Result<()> {
     let request = match command {
         AttentionCommand::List { json } => {
-            let Response::StateSnapshot { attention, .. } =
+            let Response::AttentionSnapshot { attention } =
                 client::request(paths, Request::ListAttention).await?
             else {
                 bail!("unable to list attention");
@@ -542,7 +570,7 @@ async fn attention_command(paths: &AppPaths, command: AttentionCommand) -> Resul
         AttentionCommand::Dismiss { id } => Request::DismissAttention { id },
     };
     match client::request(paths, request).await? {
-        Response::Ok => Ok(()),
+        Response::Ok | Response::AttentionSnapshot { .. } => Ok(()),
         Response::Error { message } => bail!(message),
         response => bail!("unexpected daemon response: {response:?}"),
     }
@@ -596,14 +624,9 @@ async fn capture(paths: &AppPaths, pane: String, lines: usize) -> Result<()> {
 async fn doctor(paths: &AppPaths, json: bool) -> Result<()> {
     let config = config::Config::load_or_create(paths)?;
     let home = directories::BaseDirs::new().context("cannot determine home directory")?;
-    let codex_hooks = hook_installation_valid(
-        &home.home_dir().join(".codex/hooks.json"),
-        "--provider codex",
-    );
-    let claude_hooks = hook_installation_valid(
-        &home.home_dir().join(".claude/settings.json"),
-        "--provider claude",
-    );
+    let codex_hooks = hook_installation_valid(&home.home_dir().join(".codex/hooks.json"), "codex");
+    let claude_hooks =
+        hook_installation_valid(&home.home_dir().join(".claude/settings.json"), "claude");
     let daemon = matches!(
         client::request(
             paths,
@@ -671,7 +694,37 @@ fn hook_installation_valid(location: &Path, marker: &str) -> bool {
     fs::read_to_string(location)
         .ok()
         .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-        .is_some_and(|value| value.to_string().contains(marker))
+        .is_some_and(|value| {
+            value.to_string().contains(&format!("--provider {marker}"))
+                || value
+                    .get("hooks")
+                    .into_iter()
+                    .flat_map(|hooks| {
+                        hooks
+                            .as_object()
+                            .into_iter()
+                            .flat_map(|hooks| hooks.values())
+                    })
+                    .flat_map(|groups| groups.as_array().into_iter().flatten())
+                    .flat_map(|group| {
+                        group
+                            .get("hooks")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                    })
+                    .any(|handler| {
+                        handler
+                            .get("args")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|args| {
+                                args.windows(2).any(|pair| {
+                                    pair[0].as_str() == Some("--provider")
+                                        && pair[1].as_str() == Some(marker)
+                                })
+                            })
+                    })
+        })
 }
 
 fn config_command(paths: &AppPaths, command: Option<ConfigCommand>) -> Result<()> {
@@ -693,9 +746,14 @@ fn config_command(paths: &AppPaths, command: Option<ConfigCommand>) -> Result<()
         Some(ConfigCommand::Sources) => {
             for source in integrations::config_sources(paths.config()) {
                 println!(
-                    "{:<10} {:<8} {}",
+                    "{:<10} {:<8} {:<9} {}",
                     source.provider,
                     if source.present { "present" } else { "missing" },
+                    if source.writable {
+                        "writable"
+                    } else {
+                        "read-only"
+                    },
                     source.location.display()
                 );
             }
@@ -764,6 +822,7 @@ fn hermes_command(command: HermesCommand) -> Result<()> {
 }
 
 async fn schedule_command(paths: &AppPaths, command: ScheduleCommand) -> Result<()> {
+    client::ensure_daemon(paths).await?;
     let request = match command {
         ScheduleCommand::List { json } => {
             let response = client::request(paths, Request::ListSchedules).await?;
@@ -809,9 +868,11 @@ async fn schedule_command(paths: &AppPaths, command: ScheduleCommand) -> Result<
         },
         ScheduleCommand::Remove { id } => Request::DeleteSchedule { id },
         ScheduleCommand::Run { id } => Request::RunSchedule { id },
+        ScheduleCommand::Enable { id } => Request::SetScheduleEnabled { id, enabled: true },
+        ScheduleCommand::Disable { id } => Request::SetScheduleEnabled { id, enabled: false },
     };
     match client::request(paths, request).await? {
-        Response::Ok | Response::WorkspaceCreated { .. } => Ok(()),
+        Response::Ok | Response::WorkspaceCreated { .. } | Response::Schedules { .. } => Ok(()),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected daemon response: {other:?}"),
     }
@@ -819,16 +880,31 @@ async fn schedule_command(paths: &AppPaths, command: ScheduleCommand) -> Result<
 
 async fn hook(paths: &AppPaths, arguments: HookArgs) -> Result<()> {
     let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
-    let payload: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
+    std::io::stdin()
+        .take(1_048_577)
+        .read_to_string(&mut input)?;
+    if input.len() > 1_048_576 {
+        return Ok(());
+    }
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&input) else {
+        return Ok(());
+    };
+    if !payload.is_object() {
+        return Ok(());
+    }
     let environment_pane = std::env::var("MUXLOOM_PANE_ID").ok();
     let payload_pane = payload.get("pane_id").and_then(|value| value.as_str());
-    let pane_id = arguments.pane.or_else(|| {
-        environment_pane.as_ref().and_then(|trusted| {
-            payload_pane
-                .is_none_or(|candidate| candidate == trusted)
-                .then(|| trusted.clone())
-        })
+    let pane_id = environment_pane.as_ref().and_then(|trusted| {
+        arguments
+            .pane
+            .as_deref()
+            .is_none_or(|candidate| candidate == trusted)
+            .then_some(())
+            .and_then(|()| {
+                payload_pane
+                    .is_none_or(|candidate| candidate == trusted)
+                    .then(|| trusted.clone())
+            })
     });
     let Some(pane_id) = pane_id else {
         return Ok(());
@@ -848,6 +924,11 @@ async fn hook(paths: &AppPaths, arguments: HookArgs) -> Result<()> {
             .unwrap_or(event_name)
             .to_string()
     });
+    let summary = summary
+        .replace(['\r', '\n'], " ")
+        .chars()
+        .take(512)
+        .collect::<String>();
     let _ = tokio::time::timeout(
         std::time::Duration::from_millis(100),
         client::request_passive(
@@ -857,11 +938,7 @@ async fn hook(paths: &AppPaths, arguments: HookArgs) -> Result<()> {
                 provider: arguments.provider,
                 state,
                 summary,
-                confidence: if explicit_state.is_some() {
-                    EventConfidence::Native
-                } else {
-                    EventConfidence::Inferred
-                },
+                confidence: EventConfidence::HookDerived,
             },
         ),
     )
@@ -971,25 +1048,41 @@ fn infer_hook_state(event: &str, payload: &serde_json::Value) -> AgentState {
 }
 
 fn codex_hook(executable: &str) -> serde_json::Value {
+    let handler = || {
+        serde_json::json!({
+            "type": "command",
+            "command": executable,
+            "args": ["hook", "--provider", "codex"],
+            "timeout": 5
+        })
+    };
     serde_json::json!({
         "hooks": {
-            "SessionStart": [{"hooks": [{"type": "command", "command": format!("{executable} hook --provider codex"), "timeout": 5}]}],
-            "PermissionRequest": [{"hooks": [{"type": "command", "command": format!("{executable} hook --provider codex"), "timeout": 5}]}],
-            "PostToolUse": [{"hooks": [{"type": "command", "command": format!("{executable} hook --provider codex"), "timeout": 5}]}],
-            "Stop": [{"hooks": [{"type": "command", "command": format!("{executable} hook --provider codex"), "timeout": 5}]}]
+            "SessionStart": [{"hooks": [handler()]}],
+            "PermissionRequest": [{"hooks": [handler()]}],
+            "PostToolUse": [{"hooks": [handler()]}],
+            "Stop": [{"hooks": [handler()]}]
         }
     })
 }
 
 fn claude_hook(executable: &str) -> serde_json::Value {
+    let handler = || {
+        serde_json::json!({
+            "type": "command",
+            "command": executable,
+            "args": ["hook", "--provider", "claude"],
+            "timeout": 5
+        })
+    };
     serde_json::json!({
         "hooks": {
             "Notification": [
-                {"matcher": "permission_prompt", "hooks": [{"type": "command", "command": format!("{executable} hook --provider claude")} ]},
-                {"matcher": "idle_prompt", "hooks": [{"type": "command", "command": format!("{executable} hook --provider claude")} ]}
+                {"matcher": "permission_prompt", "hooks": [handler()]},
+                {"matcher": "idle_prompt|agent_needs_input", "hooks": [handler()]}
             ],
-            "PermissionRequest": [{"matcher": "*", "hooks": [{"type": "command", "command": format!("{executable} hook --provider claude")}]}],
-            "Stop": [{"hooks": [{"type": "command", "command": format!("{executable} hook --provider claude")}]}]
+            "PermissionRequest": [{"matcher": "*", "hooks": [handler()]}],
+            "Stop": [{"hooks": [handler()]}]
         }
     })
 }

@@ -138,7 +138,10 @@ pub struct AttentionEvent {
 #[serde(rename_all = "snake_case")]
 pub enum EventConfidence {
     Native,
+    /// Protocol-v3 compatibility value. New code emits the more precise variants below.
     Inferred,
+    HookDerived,
+    OutputInferred,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

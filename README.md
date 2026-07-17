@@ -54,7 +54,7 @@ muxloom doctor
 | `Shift-Tab` / `Tab`, `1`–`9` | Switch workspace |
 | `c` | Create and switch to a named workspace |
 | `Enter` / `i` | Focus the selected terminal |
-| `v` / `s` | Choose an agent or shell for a column/row split |
+| `v` / `s` | Choose a shell, detected agent, template, or custom command, then choose its cwd |
 | `p` | Open the multi-line prompt composer (`Shift-Enter`; `Ctrl-b` broadcasts) |
 | `PgUp` | Enter copy/scrollback mode (`PgDn`, `g`, `G`, `Esc`) |
 | `z` / `b` / `o` | Zoom pane / toggle workspace rail / toggle context |
@@ -81,11 +81,15 @@ muxloom skills --json
 muxloom config sources
 muxloom config edit codex
 muxloom schedule add --name morning-review --cron '0 0 9 * * Mon-Fri' -- codex
+muxloom schedule disable SCHEDULE_ID
+muxloom schedule enable SCHEDULE_ID
 muxloom hermes status
 muxloom hermes cron list
 ```
 
 Provider token/cost UI is deliberately omitted until a provider offers a stable, attributable local data source. Muxloom does not fabricate progress percentages or cost estimates.
+
+Launcher templates and repository discovery roots are configured in `config.toml`. Run `muxloom config path` to locate it; the defaults scan `~/src` to depth four and always include recent workspace directories.
 
 ## Architecture
 

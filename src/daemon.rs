@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fs::OpenOptions,
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex as StdMutex},
     thread,
 };
@@ -23,7 +23,7 @@ use crate::{
     config::Config,
     model::{
         AgentState, AttentionEvent, EventConfidence, LayoutNode, PaneSummary, ScheduleRecord,
-        SplitAxis, UsageSnapshot, WorkspaceSummary,
+        SplitAxis, WorkspaceSummary,
     },
     paths::AppPaths,
     protocol::{
@@ -32,15 +32,17 @@ use crate::{
     },
 };
 
-const OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
-
 struct PaneRuntime {
     summary: PaneSummary,
     master: Box<dyn MasterPty + Send>,
     writer: Arc<StdMutex<Box<dyn Write + Send>>>,
-    output: VecDeque<u8>,
-    sequence: u64,
+    output: Arc<StdMutex<PaneOutput>>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+}
+
+struct PaneOutput {
+    bytes: VecDeque<u8>,
+    next_sequence: u64,
     inference_tail: VecDeque<u8>,
 }
 
@@ -49,15 +51,42 @@ struct ServerState {
     panes: HashMap<String, PaneRuntime>,
     attention: Vec<AttentionEvent>,
     schedules: Vec<ScheduleRecord>,
-    usage: Vec<UsageSnapshot>,
-    database: PathBuf,
+    database: Database,
     config: Config,
 }
 
+#[derive(Clone)]
+struct Database {
+    connection: Arc<StdMutex<Connection>>,
+}
+
+impl Database {
+    fn open(path: &Path) -> Result<Self> {
+        let connection = Connection::open(path).context("open Muxloom state database")?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
+        Ok(Self {
+            connection: Arc::new(StdMutex::new(connection)),
+        })
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        self.connection
+            .lock()
+            .map_err(|_| anyhow!("Muxloom state database lock was poisoned"))
+    }
+
+    fn checkpoint(&self) -> Result<()> {
+        self.lock()?
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+}
+
 enum RuntimeEvent {
-    Output {
+    Inference {
         pane_id: String,
-        data: Vec<u8>,
+        inferred: Option<(AgentState, String)>,
     },
     Exited {
         pane_id: String,
@@ -68,16 +97,16 @@ enum RuntimeEvent {
 pub async fn run(paths: AppPaths) -> Result<()> {
     paths.ensure()?;
     let config = Config::load_or_create(&paths)?;
-    initialize_database(&paths.database())?;
+    let database = initialize_database(&paths.database())?;
     if let Some(hours) = config.lifecycle.prune_exited_after_hours {
         prune_exited_before(
-            &paths.database(),
+            &database,
             Utc::now() - chrono::Duration::hours(hours.min(i64::MAX as u64) as i64),
         )?;
     }
-    let restored = restore_metadata(&paths.database())?;
-    let schedules = restore_schedules(&paths.database())?;
-    let attention = restore_attention(&paths.database())?;
+    let restored = restore_metadata(&database)?;
+    let schedules = restore_schedules(&database)?;
+    let attention = restore_attention(&database)?;
 
     if paths.socket().exists() {
         if UnixStream::connect(paths.socket()).await.is_ok() {
@@ -96,8 +125,7 @@ pub async fn run(paths: AppPaths) -> Result<()> {
         panes: HashMap::new(),
         attention,
         schedules,
-        usage: Vec::new(),
-        database: paths.database(),
+        database,
         config,
     }));
     let (updates, _) = broadcast::channel::<Response>(512);
@@ -123,7 +151,16 @@ pub async fn run(paths: AppPaths) -> Result<()> {
             .collect::<Vec<_>>()
     };
     for (workspace_id, title, cwd, command) in respawns {
-        match spawn_pane(&workspace_id, Some(title), cwd, command, runtime_tx.clone()) {
+        let output_limit = state.lock().await.config.scrollback.max_bytes;
+        match spawn_pane(
+            &workspace_id,
+            Some(title),
+            cwd,
+            command,
+            runtime_tx.clone(),
+            updates.clone(),
+            output_limit,
+        ) {
             Ok(pane) => {
                 let mut guard = state.lock().await;
                 let database = guard.database.clone();
@@ -157,11 +194,6 @@ pub async fn run(paths: AppPaths) -> Result<()> {
     let scheduler_runtime = runtime_tx.clone();
     tokio::spawn(async move {
         run_scheduler(scheduler_state, scheduler_updates, scheduler_runtime).await;
-    });
-
-    let usage_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        monitor_usage(usage_state).await;
     });
 
     #[cfg(unix)]
@@ -282,17 +314,21 @@ async fn handle_client(
                 .panes
                 .values()
                 .filter(|pane| pane.summary.workspace_id == workspace_id)
-                .map(|pane| {
-                    (
-                        pane.summary.id.clone(),
-                        pane.output.iter().copied().collect(),
-                        pane.sequence,
-                    )
+                .filter_map(|pane| {
+                    pane.output.lock().ok().map(|output| {
+                        (
+                            pane.summary.id.clone(),
+                            output.bytes.iter().copied().collect(),
+                            output.next_sequence,
+                        )
+                    })
                 })
                 .collect::<Vec<(String, Vec<u8>, u64)>>();
             (snapshot_locked(&guard), output)
         };
-        write_frame(&mut writer, &snapshot).await?;
+        if let Some(snapshot) = response_for_protocol(snapshot, negotiated, None, &state).await {
+            write_frame(&mut writer, &snapshot).await?;
+        }
         for (pane_id, data, sequence) in buffered_output {
             write_replay(&mut writer, pane_id, data, sequence).await?;
         }
@@ -305,7 +341,7 @@ async fn handle_client(
                             let guard = state.lock().await;
                             guard.workspaces.contains_key(&requested).then(|| guard.panes.values()
                                 .filter(|pane| pane.summary.workspace_id == requested)
-                                .map(|pane| (pane.summary.id.clone(), pane.output.iter().copied().collect(), pane.sequence))
+                                .filter_map(|pane| pane.output.lock().ok().map(|output| (pane.summary.id.clone(), output.bytes.iter().copied().collect(), output.next_sequence)))
                                 .collect::<Vec<(String, Vec<u8>, u64)>>())
                         };
                         let Some(buffered_output) = buffered_output else {
@@ -326,9 +362,17 @@ async fn handle_client(
                         continue;
                     }
                     let shutting_down = matches!(request, Request::Shutdown);
+                    let compatibility_request = request.clone();
                     match dispatch(request, &state, &updates, &runtime_tx).await {
                         Ok(Some(response)) => {
-                            write_frame(&mut writer, &response).await?;
+                            if let Some(response) = response_for_protocol(
+                                response,
+                                negotiated,
+                                Some(&compatibility_request),
+                                &state,
+                            ).await {
+                                write_frame(&mut writer, &response).await?;
+                            }
                             if shutting_down { let _ = shutdown.send(true); return Ok(()); }
                         }
                         Ok(None) => {}
@@ -342,7 +386,9 @@ async fn handle_client(
                 update = subscription.recv() => {
                     match update {
                         Ok(response) if response_matches_workspace(&response, &workspace_id, &state).await => {
-                            write_frame(&mut writer, &response).await?;
+                            if let Some(response) = response_for_protocol(response, negotiated, None, &state).await {
+                                write_frame(&mut writer, &response).await?;
+                            }
                         }
                         Ok(_) => {}
                         Err(broadcast::error::RecvError::Lagged(dropped)) => {
@@ -350,7 +396,7 @@ async fn handle_client(
                             let snapshots = {
                                 let guard = state.lock().await;
                                 guard.panes.values().filter(|pane| pane.summary.workspace_id == workspace_id)
-                                    .map(|pane| (pane.summary.id.clone(), pane.output.iter().copied().collect(), pane.sequence))
+                                    .filter_map(|pane| pane.output.lock().ok().map(|output| (pane.summary.id.clone(), output.bytes.iter().copied().collect(), output.next_sequence)))
                                     .collect::<Vec<(String, Vec<u8>, u64)>>()
                             };
                             for (pane_id, data, sequence) in snapshots { write_replay(&mut writer, pane_id, data, sequence).await?; }
@@ -363,9 +409,15 @@ async fn handle_client(
     }
 
     let shutting_down = matches!(first, Request::Shutdown);
+    let compatibility_request = first.clone();
     match dispatch(first, &state, &updates, &runtime_tx).await {
         Ok(Some(response)) => {
-            write_frame(&mut writer, &response).await?;
+            if let Some(response) =
+                response_for_protocol(response, negotiated, Some(&compatibility_request), &state)
+                    .await
+            {
+                write_frame(&mut writer, &response).await?;
+            }
             if shutting_down {
                 let _ = shutdown.send(true);
             }
@@ -384,10 +436,57 @@ async fn handle_client(
     Ok(())
 }
 
+async fn response_for_protocol(
+    mut response: Response,
+    negotiated: u16,
+    request: Option<&Request>,
+    state: &Arc<Mutex<ServerState>>,
+) -> Option<Response> {
+    if negotiated >= 4 {
+        return Some(response);
+    }
+    response = match response {
+        Response::AttentionSnapshot { .. } if matches!(request, Some(Request::ListAttention)) => {
+            let guard = state.lock().await;
+            snapshot_locked(&guard)
+        }
+        Response::AttentionSnapshot { .. } => Response::Ok,
+        Response::WorkspaceRemoved { .. } => {
+            let guard = state.lock().await;
+            snapshot_locked(&guard)
+        }
+        Response::ServerStopping => return None,
+        other => other,
+    };
+    match &mut response {
+        Response::StateSnapshot { attention, .. } => {
+            for event in attention {
+                downgrade_confidence(event);
+            }
+        }
+        Response::Attention { event } => downgrade_confidence(event),
+        _ => {}
+    }
+    Some(response)
+}
+
+fn downgrade_confidence(event: &mut AttentionEvent) {
+    if matches!(
+        event.confidence,
+        EventConfidence::HookDerived | EventConfidence::OutputInferred
+    ) {
+        event.confidence = EventConfidence::Inferred;
+    }
+}
+
 fn readonly_request_allowed(request: &Request) -> bool {
     matches!(
         request,
-        Request::List | Request::Capture { .. } | Request::ListAttention | Request::ListSchedules
+        Request::List
+            | Request::Capture { .. }
+            | Request::ResyncPane { .. }
+            | Request::ListAttention
+            | Request::ListSchedules
     )
 }
 
@@ -425,38 +524,60 @@ async fn write_replay<W: tokio::io::AsyncWrite + Unpin>(
 }
 
 async fn graceful_shutdown(state: &Arc<Mutex<ServerState>>) -> Result<usize> {
-    let pids = {
+    let (pids, grace) = {
         let guard = state.lock().await;
-        guard
-            .panes
-            .values()
-            .filter_map(|pane| pane.summary.pid)
-            .collect::<Vec<_>>()
+        (
+            guard
+                .panes
+                .values()
+                .filter(|pane| pane.summary.exited_at.is_none())
+                .filter_map(|pane| pane.summary.pid)
+                .collect::<Vec<_>>(),
+            std::time::Duration::from_secs(guard.config.lifecycle.shutdown_grace_seconds.min(30)),
+        )
     };
     for pid in &pids {
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(*pid as i32),
-            nix::sys::signal::Signal::SIGTERM,
-        );
+        signal_process_group(*pid, nix::sys::signal::Signal::SIGTERM);
     }
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let mut guard = state.lock().await;
-    let database = guard.database.clone();
-    let now = Utc::now();
-    for pane in guard.panes.values_mut() {
-        if pane.summary.exited_at.is_none() {
-            let _ = pane.killer.kill();
-            pane.summary.state = AgentState::Exited;
-            pane.summary.exited_at = Some(now);
-            pane.summary.unread = false;
-            mark_pane_exited(&database, &pane.summary.id, pane.summary.exit_status)?;
+    wait_for_pane_exit(state, grace).await;
+    {
+        let mut guard = state.lock().await;
+        for pane in guard.panes.values_mut() {
+            if pane.summary.exited_at.is_none() {
+                if let Some(pid) = pane.summary.pid {
+                    signal_process_group(pid, nix::sys::signal::Signal::SIGKILL);
+                }
+                let _ = pane.killer.kill();
+            }
         }
     }
-    let workspace_ids = guard.workspaces.keys().cloned().collect::<Vec<_>>();
-    for workspace_id in workspace_ids {
-        sync_workspace_panes(&mut guard, &workspace_id);
-    }
+    wait_for_pane_exit(state, std::time::Duration::from_secs(1)).await;
+    state.lock().await.database.checkpoint()?;
     Ok(pids.len())
+}
+
+fn signal_process_group(pid: u32, signal: nix::sys::signal::Signal) {
+    let group = nix::unistd::Pid::from_raw(-(pid as i32));
+    if nix::sys::signal::kill(group, signal).is_err() {
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal);
+    }
+}
+
+async fn wait_for_pane_exit(state: &Arc<Mutex<ServerState>>, timeout: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if state
+            .lock()
+            .await
+            .panes
+            .values()
+            .all(|pane| pane.summary.exited_at.is_some())
+            || tokio::time::Instant::now() >= deadline
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 async fn dispatch(
@@ -486,8 +607,19 @@ async fn dispatch(
             command,
             respawn,
         } => {
-            let workspace =
-                create_workspace(state, runtime_tx, name, cwd, command, None, respawn).await?;
+            let workspace = create_workspace(
+                state,
+                updates,
+                runtime_tx,
+                WorkspaceLaunch {
+                    name,
+                    cwd,
+                    command,
+                    schedule_id: None,
+                    respawn,
+                },
+            )
+            .await?;
             Response::WorkspaceCreated { workspace }
         }
         Request::CreatePane {
@@ -498,7 +630,16 @@ async fn dispatch(
             split_from,
             split_axis,
         } => {
-            let pane = spawn_pane(&workspace_id, title, cwd, command, runtime_tx.clone())?;
+            let output_limit = state.lock().await.config.scrollback.max_bytes;
+            let pane = spawn_pane(
+                &workspace_id,
+                title,
+                cwd,
+                command,
+                runtime_tx.clone(),
+                updates.clone(),
+                output_limit,
+            )?;
             let mut guard = state.lock().await;
             let database = guard.database.clone();
             let workspace = guard
@@ -574,9 +715,27 @@ async fn dispatch(
             let data = guard
                 .panes
                 .get(&pane_id)
-                .map(|pane| tail_lines(&pane.output, lines))
+                .and_then(|pane| pane.output.lock().ok())
+                .map(|output| tail_lines(&output.bytes, lines))
                 .unwrap_or_default();
             Response::Capture { pane_id, data }
+        }
+        Request::ResyncPane { pane_id } => {
+            let guard = state.lock().await;
+            let pane = guard
+                .panes
+                .get(&pane_id)
+                .ok_or_else(|| anyhow!("pane {pane_id} is not running"))?;
+            let output = pane
+                .output
+                .lock()
+                .map_err(|_| anyhow!("pane output lock was poisoned"))?;
+            Response::PaneSnapshot {
+                pane_id,
+                data: output.bytes.iter().copied().collect(),
+                sequence: output.next_sequence,
+                reset: true,
+            }
         }
         Request::ClosePane { pane_id } => {
             let mut guard = state.lock().await;
@@ -638,11 +797,7 @@ async fn dispatch(
                 }
             }
             delete_workspace(&guard.database, &workspace_id)?;
-            let response = Response::StateSnapshot {
-                workspaces: guard.workspaces.values().cloned().collect(),
-                attention: guard.attention.clone(),
-                usage: guard.usage.clone(),
-            };
+            let response = Response::WorkspaceRemoved { workspace_id };
             let _ = updates.send(response.clone());
             response
         }
@@ -723,10 +878,8 @@ async fn dispatch(
         }
         Request::ListAttention => {
             let guard = state.lock().await;
-            Response::StateSnapshot {
-                workspaces: Vec::new(),
+            Response::AttentionSnapshot {
                 attention: guard.attention.clone(),
-                usage: Vec::new(),
             }
         }
         Request::MarkAttentionRead { id } => {
@@ -735,7 +888,11 @@ async fn dispatch(
                 event.read_at = Some(Utc::now());
             }
             persist_attention(&guard.database, &guard.attention)?;
-            Response::Ok
+            let response = Response::AttentionSnapshot {
+                attention: guard.attention.clone(),
+            };
+            let _ = updates.send(response.clone());
+            response
         }
         Request::MarkAllAttentionRead => {
             let mut guard = state.lock().await;
@@ -746,13 +903,21 @@ async fn dispatch(
                 }
             }
             persist_attention(&guard.database, &guard.attention)?;
-            Response::Ok
+            let response = Response::AttentionSnapshot {
+                attention: guard.attention.clone(),
+            };
+            let _ = updates.send(response.clone());
+            response
         }
         Request::DismissAttention { id } => {
             let mut guard = state.lock().await;
             guard.attention.retain(|event| event.id != id);
             persist_attention(&guard.database, &guard.attention)?;
-            Response::Ok
+            let response = Response::AttentionSnapshot {
+                attention: guard.attention.clone(),
+            };
+            let _ = updates.send(response.clone());
+            response
         }
         Request::ListSchedules => {
             let guard = state.lock().await;
@@ -767,13 +932,42 @@ async fn dispatch(
             persist_schedule(&guard.database, &schedule)?;
             guard.schedules.retain(|item| item.id != schedule.id);
             guard.schedules.push(schedule);
-            Response::Ok
+            let response = Response::Schedules {
+                schedules: guard.schedules.clone(),
+            };
+            let _ = updates.send(response.clone());
+            response
         }
         Request::DeleteSchedule { id } => {
             let mut guard = state.lock().await;
             guard.schedules.retain(|item| item.id != id);
             delete_schedule(&guard.database, &id)?;
-            Response::Ok
+            let response = Response::Schedules {
+                schedules: guard.schedules.clone(),
+            };
+            let _ = updates.send(response.clone());
+            response
+        }
+        Request::SetScheduleEnabled { id, enabled } => {
+            let mut guard = state.lock().await;
+            let database = guard.database.clone();
+            let schedule = guard
+                .schedules
+                .iter_mut()
+                .find(|schedule| schedule.id == id)
+                .ok_or_else(|| anyhow!("schedule {id} does not exist"))?;
+            schedule.enabled = enabled;
+            schedule.next_run_at = if enabled {
+                calculate_next_run(schedule, Utc::now())?
+            } else {
+                None
+            };
+            persist_schedule(&database, schedule)?;
+            let response = Response::Schedules {
+                schedules: guard.schedules.clone(),
+            };
+            let _ = updates.send(response.clone());
+            response
         }
         Request::RunSchedule { id } => {
             let schedule = {
@@ -792,24 +986,32 @@ async fn dispatch(
                     .ok_or_else(|| anyhow!("schedule {id} does not exist"))?
             };
             cleanup_schedule_workspaces(state, &schedule.id).await?;
-            let name = format!("schedule-{}", schedule.name);
             let workspace = create_workspace(
                 state,
+                updates,
                 runtime_tx,
-                name,
-                schedule.cwd,
-                schedule.command,
-                Some(schedule.id),
-                false,
+                WorkspaceLaunch {
+                    name: format!("schedule-{}", schedule.name),
+                    cwd: schedule.cwd,
+                    command: schedule.command,
+                    schedule_id: Some(schedule.id),
+                    respawn: false,
+                },
             )
             .await?;
             Response::WorkspaceCreated { workspace }
         }
         Request::Shutdown => {
             warn!("shutdown requested");
-            Response::ShutdownComplete {
-                terminated_panes: state.lock().await.panes.len(),
-            }
+            let _ = updates.send(Response::ServerStopping);
+            let terminated_panes = state
+                .lock()
+                .await
+                .panes
+                .values()
+                .filter(|pane| pane.summary.exited_at.is_none())
+                .count();
+            Response::ShutdownComplete { terminated_panes }
         }
         Request::Hello { .. } => bail!("handshake is already complete"),
         Request::Attach { .. } => bail!("attach must be the first request on a connection"),
@@ -820,14 +1022,19 @@ async fn dispatch(
     Ok(Some(response))
 }
 
-async fn create_workspace(
-    state: &Arc<Mutex<ServerState>>,
-    runtime_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+struct WorkspaceLaunch {
     name: String,
     cwd: String,
     command: Vec<String>,
     schedule_id: Option<String>,
     respawn: bool,
+}
+
+async fn create_workspace(
+    state: &Arc<Mutex<ServerState>>,
+    updates: &broadcast::Sender<Response>,
+    runtime_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    launch: WorkspaceLaunch,
 ) -> Result<WorkspaceSummary> {
     let workspace_id = Uuid::new_v4().to_string();
     let mut workspace = WorkspaceSummary {
@@ -836,18 +1043,27 @@ async fn create_workspace(
         created_at: Utc::now(),
         panes: Vec::new(),
         layout: None,
-        respawn,
-        schedule_id,
+        respawn: launch.respawn,
+        schedule_id: launch.schedule_id,
     };
     {
         let mut guard = state.lock().await;
-        workspace.name = unique_workspace_name_locked(&guard, &name);
+        workspace.name = unique_workspace_name_locked(&guard, &launch.name);
         guard
             .workspaces
             .insert(workspace_id.clone(), workspace.clone());
         persist_workspace(&guard.database, &workspace)?;
     }
-    let pane = match spawn_pane(&workspace_id, None, cwd, command, runtime_tx.clone()) {
+    let output_limit = state.lock().await.config.scrollback.max_bytes;
+    let pane = match spawn_pane(
+        &workspace_id,
+        None,
+        launch.cwd,
+        launch.command,
+        runtime_tx.clone(),
+        updates.clone(),
+        output_limit,
+    ) {
         Ok(pane) => pane,
         Err(problem) => {
             let mut guard = state.lock().await;
@@ -873,6 +1089,8 @@ fn spawn_pane(
     cwd: String,
     mut command: Vec<String>,
     runtime_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    updates: broadcast::Sender<Response>,
+    output_limit: usize,
 ) -> Result<PaneRuntime> {
     if command.is_empty() {
         command.push(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
@@ -913,23 +1131,64 @@ fn spawn_pane(
     let writer = Arc::new(StdMutex::new(
         pair.master.take_writer().context("take PTY writer")?,
     ));
+    let output = Arc::new(StdMutex::new(PaneOutput {
+        bytes: VecDeque::new(),
+        next_sequence: 0,
+        inference_tail: VecDeque::new(),
+    }));
     let output_pane_id = pane_id.clone();
+    let output_workspace_id = workspace_id.to_string();
+    let reader_output = Arc::clone(&output);
     thread::Builder::new()
         .name(format!("muxloom-pane-{}", &pane_id[..8]))
         .spawn(move || {
             let mut buffer = [0_u8; 8192];
+            let mut clean_chunks = 0_u8;
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(count) => {
-                        if runtime_tx
-                            .send(RuntimeEvent::Output {
-                                pane_id: output_pane_id.clone(),
-                                data: buffer[..count].to_vec(),
-                            })
-                            .is_err()
-                        {
-                            return;
+                        let data = buffer[..count].to_vec();
+                        let (sequence, inferred) = match reader_output.lock() {
+                            Ok(mut output) => {
+                                output.bytes.extend(&data);
+                                trim_output_buffer(&mut output.bytes, output_limit);
+                                output.inference_tail.extend(&data);
+                                while output.inference_tail.len() > 8 * 1024 {
+                                    output.inference_tail.pop_front();
+                                }
+                                let inferred = infer_state(
+                                    &output.inference_tail.iter().copied().collect::<Vec<_>>(),
+                                );
+                                let sequence = output.next_sequence;
+                                output.next_sequence = output.next_sequence.saturating_add(1);
+                                (sequence, inferred)
+                            }
+                            Err(_) => return,
+                        };
+                        let _ = updates.send(Response::Output {
+                            workspace_id: output_workspace_id.clone(),
+                            pane_id: output_pane_id.clone(),
+                            data,
+                            sequence,
+                        });
+                        match inferred {
+                            Some(inferred) => {
+                                clean_chunks = 0;
+                                let _ = runtime_tx.send(RuntimeEvent::Inference {
+                                    pane_id: output_pane_id.clone(),
+                                    inferred: Some(inferred),
+                                });
+                            }
+                            None => {
+                                clean_chunks = clean_chunks.saturating_add(1);
+                                if clean_chunks == 2 {
+                                    let _ = runtime_tx.send(RuntimeEvent::Inference {
+                                        pane_id: output_pane_id.clone(),
+                                        inferred: None,
+                                    });
+                                }
+                            }
                         }
                     }
                     Err(_) => break,
@@ -970,10 +1229,8 @@ fn spawn_pane(
         summary,
         master: pair.master,
         writer,
-        output: VecDeque::new(),
-        sequence: 0,
+        output,
         killer,
-        inference_tail: VecDeque::new(),
     })
 }
 
@@ -983,76 +1240,44 @@ async fn process_runtime_event(
     event: RuntimeEvent,
 ) -> Result<()> {
     match event {
-        RuntimeEvent::Output { pane_id, data } => {
+        RuntimeEvent::Inference { pane_id, inferred } => {
             let mut guard = state.lock().await;
-            let scrollback_limit = guard
-                .config
-                .scrollback
-                .lines
-                .saturating_mul(240)
-                .max(64 * 1024);
-            let mut inferred = None;
-            let mut state_changed = false;
-            let mut workspace_id = None;
-            if let Some(pane) = guard.panes.get_mut(&pane_id) {
-                workspace_id = Some(pane.summary.workspace_id.clone());
-                pane.output.extend(&data);
-                let limit = scrollback_limit.min(OUTPUT_BUFFER_BYTES);
-                while pane.output.len() > limit {
-                    while pane.output.pop_front().is_some_and(|byte| byte != b'\n') {}
-                }
-                pane.inference_tail.extend(&data);
-                while pane.inference_tail.len() > 4096 {
-                    pane.inference_tail.pop_front();
-                }
-                inferred = infer_state(&pane.inference_tail.iter().copied().collect::<Vec<_>>());
-                if matches!(
-                    pane.summary.state,
-                    AgentState::Starting | AgentState::Error | AgentState::WaitingInput
-                ) && inferred.is_none()
-                {
-                    pane.summary.state = AgentState::Working;
-                    state_changed = true;
-                }
-            }
+            let Some((workspace_id, provider, current_state)) =
+                guard.panes.get(&pane_id).map(|pane| {
+                    (
+                        pane.summary.workspace_id.clone(),
+                        pane.summary.provider.clone(),
+                        pane.summary.state,
+                    )
+                })
+            else {
+                return Ok(());
+            };
             if let Some((next_state, summary)) = inferred {
-                let provider = guard
-                    .panes
-                    .get(&pane_id)
-                    .map(|pane| pane.summary.provider.clone())
-                    .unwrap_or_else(|| "generic".into());
                 apply_agent_event(
                     &mut guard,
                     &pane_id,
                     &provider,
                     next_state,
                     &summary,
-                    EventConfidence::Inferred,
+                    EventConfidence::OutputInferred,
                 )?;
-                state_changed = true;
+            } else if matches!(
+                current_state,
+                AgentState::Starting
+                    | AgentState::Error
+                    | AgentState::WaitingInput
+                    | AgentState::WaitingApproval
+            ) && let Some(pane) = guard.panes.get_mut(&pane_id)
+            {
+                pane.summary.state = AgentState::Working;
+                pane.summary.unread = false;
             }
-            let output_workspace_id = workspace_id.clone().unwrap_or_default();
-            if state_changed && let Some(workspace_id) = workspace_id {
-                sync_workspace_panes(&mut guard, &workspace_id);
-                if let Some(workspace) = guard.workspaces.get(&workspace_id).cloned() {
-                    let _ = updates.send(Response::PaneUpdated { workspace });
-                }
+            sync_workspace_panes(&mut guard, &workspace_id);
+            persist_attention(&guard.database, &guard.attention)?;
+            if let Some(workspace) = guard.workspaces.get(&workspace_id).cloned() {
+                let _ = updates.send(Response::PaneUpdated { workspace });
             }
-            if state_changed {
-                persist_attention(&guard.database, &guard.attention)?;
-            }
-            let sequence = guard.panes.get_mut(&pane_id).map_or(0, |pane| {
-                let sequence = pane.sequence;
-                pane.sequence = pane.sequence.saturating_add(1);
-                sequence
-            });
-            drop(guard);
-            let _ = updates.send(Response::Output {
-                workspace_id: output_workspace_id,
-                pane_id,
-                data,
-                sequence,
-            });
         }
         RuntimeEvent::Exited {
             pane_id,
@@ -1084,11 +1309,35 @@ async fn process_runtime_event(
             mark_pane_exited(&database, &pane_id, exit_status)?;
             if let Some(workspace_id) = workspace_id {
                 sync_workspace_panes(&mut guard, &workspace_id);
-                if let Some(workspace) = guard.workspaces.get(&workspace_id).cloned() {
+                let scheduled_done = guard
+                    .workspaces
+                    .get(&workspace_id)
+                    .is_some_and(|workspace| {
+                        workspace.schedule_id.is_some()
+                            && workspace.panes.iter().all(|pane| pane.exited_at.is_some())
+                    });
+                if scheduled_done {
+                    guard.workspaces.remove(&workspace_id);
+                    guard
+                        .panes
+                        .retain(|_, pane| pane.summary.workspace_id != workspace_id);
+                    delete_workspace(&database, &workspace_id)?;
+                    let _ = updates.send(Response::WorkspaceRemoved { workspace_id });
+                } else if let Some(workspace) = guard.workspaces.get(&workspace_id).cloned() {
                     let _ = updates.send(Response::PaneUpdated { workspace });
                 }
             }
-            if let Some(event) = guard.attention.last().cloned() {
+            if let Some(event) = guard
+                .attention
+                .iter()
+                .rev()
+                .find(|event| {
+                    event.pane_id == pane_id
+                        && event.kind == AgentState::CompletedUnread
+                        && event.read_at.is_none()
+                })
+                .cloned()
+            {
                 let _ = updates.send(Response::Attention { event });
             }
             persist_attention(&guard.database, &guard.attention)?;
@@ -1180,61 +1429,7 @@ fn snapshot_locked(state: &ServerState) -> Response {
     Response::StateSnapshot {
         workspaces,
         attention: state.attention.clone(),
-        usage: state.usage.clone(),
-    }
-}
-
-async fn monitor_usage(state: Arc<Mutex<ServerState>>) {
-    let mut system = System::new();
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        ticker.tick().await;
-        let panes = {
-            let guard = state.lock().await;
-            guard
-                .panes
-                .values()
-                .filter(|pane| pane.summary.exited_at.is_none())
-                .map(|pane| pane.summary.clone())
-                .collect::<Vec<_>>()
-        };
-        let mut worker_system = std::mem::replace(&mut system, System::new());
-        let refreshed = tokio::task::spawn_blocking(move || {
-            let process_ids = panes
-                .iter()
-                .filter_map(|pane| pane.pid.map(Pid::from_u32))
-                .collect::<Vec<_>>();
-            if !process_ids.is_empty() {
-                worker_system.refresh_processes(ProcessesToUpdate::Some(&process_ids), true);
-            }
-            let usage = panes
-                .into_iter()
-                .map(|pane| {
-                    let process = pane
-                        .pid
-                        .and_then(|pid| worker_system.process(Pid::from_u32(pid)));
-                    UsageSnapshot {
-                        pane_id: pane.id,
-                        cpu_percent: process.map_or(0.0, sysinfo::Process::cpu_usage),
-                        memory_bytes: process.map_or(0, sysinfo::Process::memory),
-                        elapsed_seconds: (Utc::now() - pane.started_at).num_seconds().max(0) as u64,
-                        input_tokens: None,
-                        output_tokens: None,
-                        cost_usd: None,
-                    }
-                })
-                .collect();
-            (worker_system, usage)
-        })
-        .await;
-        let Ok((next_system, usage)) = refreshed else {
-            warn!("usage monitor worker failed");
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            continue;
-        };
-        system = next_system;
-        state.lock().await.usage = usage;
+        usage: Vec::new(),
     }
 }
 
@@ -1406,6 +1601,34 @@ fn infer_state(data: &[u8]) -> Option<(AgentState, String)> {
     }
 }
 
+fn trim_output_buffer(output: &mut VecDeque<u8>, limit: usize) {
+    while output.len() > limit {
+        let excess = output.len() - limit;
+        if let Some(newline) = output.iter().take(excess).position(|byte| *byte == b'\n') {
+            for _ in 0..=newline {
+                output.pop_front();
+            }
+            continue;
+        }
+        for _ in 0..excess {
+            output.pop_front();
+        }
+        while output
+            .front()
+            .is_some_and(|byte| byte & 0b1100_0000 == 0b1000_0000)
+        {
+            output.pop_front();
+        }
+        // A single line exceeded the cap. Reset terminal state before replaying its tail so a
+        // snapshot never begins in a stale escape sequence.
+        output.push_front(b'c');
+        output.push_front(0x1b);
+        while output.len() > limit {
+            output.pop_back();
+        }
+    }
+}
+
 fn tail_lines(output: &VecDeque<u8>, lines: usize) -> Vec<u8> {
     let bytes = output.iter().copied().collect::<Vec<_>>();
     if lines == 0 {
@@ -1514,12 +1737,15 @@ async fn run_scheduler(
             let schedule_id = schedule.id.clone();
             match create_workspace(
                 &state,
+                &updates,
                 &runtime_tx,
-                format!("schedule-{}", schedule.name),
-                schedule.cwd,
-                schedule.command,
-                Some(schedule_id),
-                false,
+                WorkspaceLaunch {
+                    name: format!("schedule-{}", schedule.name),
+                    cwd: schedule.cwd,
+                    command: schedule.command,
+                    schedule_id: Some(schedule_id),
+                    respawn: false,
+                },
             )
             .await
             {
@@ -1553,8 +1779,9 @@ async fn cleanup_schedule_workspaces(
     Ok(())
 }
 
-fn initialize_database(database: &Path) -> Result<()> {
-    let connection = open_database(database)?;
+fn initialize_database(path: &Path) -> Result<Database> {
+    let database = Database::open(path)?;
+    let connection = database.lock()?;
     connection.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA foreign_keys=ON;
@@ -1603,15 +1830,9 @@ fn initialize_database(database: &Path) -> Result<()> {
             ))?;
         }
     }
-    connection.pragma_update(None, "user_version", 2)?;
-    Ok(())
-}
-
-fn open_database(database: &Path) -> Result<Connection> {
-    let connection = Connection::open(database).context("open Muxloom state database")?;
-    connection.busy_timeout(std::time::Duration::from_secs(5))?;
-    connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
-    Ok(connection)
+    connection.pragma_update(None, "user_version", 3)?;
+    drop(connection);
+    Ok(database)
 }
 
 fn database_column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -1625,8 +1846,8 @@ fn database_column_exists(connection: &Connection, table: &str, column: &str) ->
     Ok(false)
 }
 
-fn persist_workspace(database: &Path, workspace: &WorkspaceSummary) -> Result<()> {
-    let connection = open_database(database)?;
+fn persist_workspace(database: &Database, workspace: &WorkspaceSummary) -> Result<()> {
+    let connection = database.lock()?;
     connection.execute(
         "INSERT OR REPLACE INTO workspaces (id, name, created_at, layout_json, respawn, schedule_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
@@ -1641,8 +1862,8 @@ fn persist_workspace(database: &Path, workspace: &WorkspaceSummary) -> Result<()
     Ok(())
 }
 
-fn persist_pane(database: &Path, pane: &PaneSummary) -> Result<()> {
-    let connection = open_database(database)?;
+fn persist_pane(database: &Database, pane: &PaneSummary) -> Result<()> {
+    let connection = database.lock()?;
     connection.execute(
         "INSERT OR REPLACE INTO panes
          (id, workspace_id, title, cwd, command_json, provider, started_at, exited_at, pid, exit_status, daemon_lost)
@@ -1665,11 +1886,11 @@ fn persist_pane(database: &Path, pane: &PaneSummary) -> Result<()> {
 }
 
 fn persist_workspace_with_pane(
-    database: &Path,
+    database: &Database,
     workspace: &WorkspaceSummary,
     pane: &PaneSummary,
 ) -> Result<()> {
-    let mut connection = open_database(database)?;
+    let mut connection = database.lock()?;
     let transaction = connection.transaction()?;
     transaction.execute(
         "INSERT OR REPLACE INTO workspaces (id, name, created_at, layout_json, respawn, schedule_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1683,8 +1904,8 @@ fn persist_workspace_with_pane(
     Ok(())
 }
 
-fn mark_pane_exited(database: &Path, pane_id: &str, exit_status: Option<i32>) -> Result<()> {
-    let connection = open_database(database)?;
+fn mark_pane_exited(database: &Database, pane_id: &str, exit_status: Option<i32>) -> Result<()> {
+    let connection = database.lock()?;
     connection.execute(
         "UPDATE panes SET exited_at = ?1, exit_status = ?2, daemon_lost = 0 WHERE id = ?3",
         params![Utc::now().to_rfc3339(), exit_status, pane_id],
@@ -1692,8 +1913,8 @@ fn mark_pane_exited(database: &Path, pane_id: &str, exit_status: Option<i32>) ->
     Ok(())
 }
 
-fn restore_metadata(database: &Path) -> Result<Vec<WorkspaceSummary>> {
-    let connection = open_database(database)?;
+fn restore_metadata(database: &Database) -> Result<Vec<WorkspaceSummary>> {
+    let connection = database.lock()?;
     let mut statement = connection.prepare(
         "SELECT id, name, created_at, layout_json, respawn, schedule_id FROM workspaces",
     )?;
@@ -1796,8 +2017,8 @@ fn process_matches_start(pid: u32, started_at: chrono::DateTime<Utc>) -> bool {
         .is_some_and(|process| (process.start_time() as i64 - started_at.timestamp()).abs() <= 5)
 }
 
-fn persist_schedule(database: &Path, schedule: &ScheduleRecord) -> Result<()> {
-    let connection = open_database(database)?;
+fn persist_schedule(database: &Database, schedule: &ScheduleRecord) -> Result<()> {
+    let connection = database.lock()?;
     connection.execute(
         "INSERT OR REPLACE INTO schedules (id, record_json) VALUES (?1, ?2)",
         params![schedule.id, serde_json::to_string(schedule)?],
@@ -1805,13 +2026,15 @@ fn persist_schedule(database: &Path, schedule: &ScheduleRecord) -> Result<()> {
     Ok(())
 }
 
-fn delete_schedule(database: &Path, id: &str) -> Result<()> {
-    open_database(database)?.execute("DELETE FROM schedules WHERE id = ?1", params![id])?;
+fn delete_schedule(database: &Database, id: &str) -> Result<()> {
+    database
+        .lock()?
+        .execute("DELETE FROM schedules WHERE id = ?1", params![id])?;
     Ok(())
 }
 
-fn restore_schedules(database: &Path) -> Result<Vec<ScheduleRecord>> {
-    let connection = open_database(database)?;
+fn restore_schedules(database: &Database) -> Result<Vec<ScheduleRecord>> {
+    let connection = database.lock()?;
     let mut statement = connection.prepare("SELECT record_json FROM schedules")?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     let mut schedules = Vec::new();
@@ -1824,8 +2047,8 @@ fn restore_schedules(database: &Path) -> Result<Vec<ScheduleRecord>> {
     Ok(schedules)
 }
 
-fn delete_workspace(database: &Path, workspace_id: &str) -> Result<()> {
-    let mut connection = open_database(database)?;
+fn delete_workspace(database: &Database, workspace_id: &str) -> Result<()> {
+    let mut connection = database.lock()?;
     let transaction = connection.transaction()?;
     transaction.execute(
         "DELETE FROM panes WHERE workspace_id = ?1",
@@ -1839,8 +2062,8 @@ fn delete_workspace(database: &Path, workspace_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn prune_exited(database: &Path, workspace_id: Option<&str>) -> Result<()> {
-    let connection = open_database(database)?;
+fn prune_exited(database: &Database, workspace_id: Option<&str>) -> Result<()> {
+    let connection = database.lock()?;
     if let Some(workspace_id) = workspace_id {
         connection.execute(
             "DELETE FROM panes WHERE exited_at IS NOT NULL AND workspace_id = ?1",
@@ -1852,16 +2075,16 @@ fn prune_exited(database: &Path, workspace_id: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn prune_exited_before(database: &Path, cutoff: chrono::DateTime<Utc>) -> Result<()> {
-    open_database(database)?.execute(
+fn prune_exited_before(database: &Database, cutoff: chrono::DateTime<Utc>) -> Result<()> {
+    database.lock()?.execute(
         "DELETE FROM panes WHERE exited_at IS NOT NULL AND exited_at < ?1",
         params![cutoff.to_rfc3339()],
     )?;
     Ok(())
 }
 
-fn persist_attention(database: &Path, attention: &[AttentionEvent]) -> Result<()> {
-    let mut connection = open_database(database)?;
+fn persist_attention(database: &Database, attention: &[AttentionEvent]) -> Result<()> {
+    let mut connection = database.lock()?;
     let transaction = connection.transaction()?;
     transaction.execute("DELETE FROM attention", [])?;
     let cutoff = Utc::now() - chrono::Duration::days(30);
@@ -1880,8 +2103,8 @@ fn persist_attention(database: &Path, attention: &[AttentionEvent]) -> Result<()
     Ok(())
 }
 
-fn restore_attention(database: &Path) -> Result<Vec<AttentionEvent>> {
-    let connection = open_database(database)?;
+fn restore_attention(database: &Database) -> Result<Vec<AttentionEvent>> {
+    let connection = database.lock()?;
     let mut statement = connection.prepare("SELECT record_json FROM attention")?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     let mut events = Vec::new();
@@ -2000,21 +2223,38 @@ mod tests {
     }
 
     #[test]
+    fn protocol_three_confidence_is_downgraded() {
+        let mut event = AttentionEvent {
+            id: "event".into(),
+            pane_id: "pane".into(),
+            provider: "codex".into(),
+            kind: AgentState::WaitingApproval,
+            severity: 2,
+            summary: "approval required".into(),
+            created_at: Utc::now(),
+            read_at: None,
+            confidence: EventConfidence::HookDerived,
+        };
+        downgrade_confidence(&mut event);
+        assert_eq!(event.confidence, EventConfidence::Inferred);
+    }
+
+    #[test]
     fn legacy_database_is_migrated_in_place() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("state.db");
         let connection = Connection::open(&database).unwrap();
         connection.execute_batch("CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE panes (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, title TEXT NOT NULL, cwd TEXT NOT NULL, command_json TEXT NOT NULL, provider TEXT NOT NULL, started_at TEXT NOT NULL, exited_at TEXT); CREATE TABLE schedules (id TEXT PRIMARY KEY, record_json TEXT NOT NULL);").unwrap();
         drop(connection);
-        initialize_database(&database).unwrap();
-        let connection = open_database(&database).unwrap();
+        let database = initialize_database(&database).unwrap();
+        let connection = database.lock().unwrap();
         assert!(database_column_exists(&connection, "workspaces", "layout_json").unwrap());
         assert!(database_column_exists(&connection, "panes", "exit_status").unwrap());
         assert_eq!(
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
-            2
+            3
         );
     }
 }

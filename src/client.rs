@@ -126,7 +126,15 @@ pub async fn stop_daemon(paths: &AppPaths) -> Result<usize> {
     handshake(&mut stream).await?;
     write_frame(&mut stream, &Request::Shutdown).await?;
     match read_frame(&mut stream).await? {
-        Response::ShutdownComplete { terminated_panes } => Ok(terminated_panes),
+        Response::ShutdownComplete { terminated_panes } => {
+            for _ in 0..100 {
+                if !paths.socket().exists() {
+                    return Ok(terminated_panes);
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+            bail!("daemon acknowledged shutdown but did not stop within 5 seconds")
+        }
         Response::Error { message } => bail!(message),
         response => bail!("unexpected shutdown response: {response:?}"),
     }
@@ -151,32 +159,22 @@ pub async fn attach(paths: &AppPaths, workspace_id: String, readonly: bool) -> R
     let Response::StateSnapshot {
         workspaces,
         attention,
-        usage,
+        ..
     } = initial
     else {
         return Err(anyhow!("daemon rejected attach: {initial:?}"));
     };
     let config = crate::config::Config::load_or_create(paths)?;
-    let mut app = App::new(
-        workspace_id,
-        workspaces,
-        attention,
-        usage,
-        Vec::new(),
-        Vec::new(),
-        Default::default(),
-        config,
-    );
+    let mouse_enabled = config.ui.mouse;
+    let mut app = App::new(workspace_id, workspaces, attention, config);
     enable_raw_mode().context("enable terminal raw mode")?;
     let mut stdout = std::io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture
-    )
-    .context("enter alternate screen")?;
-    let mut guard = TerminalGuard;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
+        .context("enter alternate screen")?;
+    if mouse_enabled {
+        execute!(stdout, EnableMouseCapture).context("enable mouse capture")?;
+    }
+    let mut guard = TerminalGuard { mouse_enabled };
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("create terminal")?;
     terminal.clear()?;
@@ -196,14 +194,21 @@ pub async fn attach(paths: &AppPaths, workspace_id: String, readonly: bool) -> R
             },
             server = read_frame::<_, Response>(&mut reader) => {
                 let response = server?;
+                let server_stopping = matches!(response, Response::ServerStopping);
                 let created_workspace = match &response {
                     Response::WorkspaceCreated { workspace } => Some(workspace.id.clone()),
                     _ => None,
                 };
                 app.apply(response);
+                for pane_id in app.take_resyncs() {
+                    write_frame(&mut writer, &Request::ResyncPane { pane_id }).await?;
+                }
                 dirty = true;
                 if let Some(workspace_id) = created_workspace {
                     write_frame(&mut writer, &Request::SwitchWorkspace { workspace_id }).await?;
+                }
+                if server_stopping {
+                    break;
                 }
             }
             terminal_event = events.next() => {
@@ -235,14 +240,18 @@ pub async fn attach(paths: &AppPaths, workspace_id: String, readonly: bool) -> R
     Ok(())
 }
 
-struct TerminalGuard;
+struct TerminalGuard {
+    mouse_enabled: bool,
+}
 
 impl TerminalGuard {
     fn restore(&mut self) -> Result<()> {
         disable_raw_mode().context("disable terminal raw mode")?;
+        if self.mouse_enabled {
+            execute!(std::io::stdout(), DisableMouseCapture).context("disable mouse capture")?;
+        }
         execute!(
             std::io::stdout(),
-            DisableMouseCapture,
             DisableBracketedPaste,
             LeaveAlternateScreen
         )
@@ -254,9 +263,11 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        if self.mouse_enabled {
+            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        }
         let _ = execute!(
             std::io::stdout(),
-            DisableMouseCapture,
             DisableBracketedPaste,
             LeaveAlternateScreen
         );
