@@ -48,7 +48,7 @@ jobs:
           MUXLOOM_VERSION="$version" MUXLOOM_BINARY="target/$TARGET/release/muxloom" nfpm package --config packaging/nfpm.yaml --packager deb --target "muxloom_${version}_${NFPM_ARCH}.deb"
           MUXLOOM_VERSION="$version" MUXLOOM_BINARY="target/$TARGET/release/muxloom" nfpm package --config packaging/nfpm.yaml --packager rpm --target "muxloom-${version}.${NFPM_ARCH}.rpm"
           cp muxloom.cdx.json "muxloom-$version-$TARGET.cdx.json"
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: artifacts-${{ matrix.arch }}
           path: |
