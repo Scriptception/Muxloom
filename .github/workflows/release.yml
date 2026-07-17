@@ -67,7 +67,7 @@ jobs:
           merge-multiple: true
       - name: Checksums
         run: sha256sum muxloom-* > SHA256SUMS
-      - uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Keyless signatures
         run: |
           for artifact in muxloom-* SHA256SUMS; do cosign sign-blob --yes --bundle "$artifact.sigstore.json" "$artifact"; done
